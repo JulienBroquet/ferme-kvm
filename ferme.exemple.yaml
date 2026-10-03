@@ -1,0 +1,36 @@
+# Configuration de la ferme — à protéger : chmod 600 ferme.yaml
+# Les mots de passe ne servent qu'à « Préparer la ferme » ; ensuite tout passe par clés SSH.
+# Comptes NON sudoers : la préparation a besoin du mot de passe root du PC.
+#   - soit l'interface le demande au moment de la préparation (recommandé, rien n'est enregistré),
+#   - soit indiquez mot_de_passe_root (dans defaut ou pour un PC précis).
+
+stockage:
+  ip: 192.168.100.10
+  utilisateur: stockage
+  mot_de_passe: "ChangeMoi"
+  chemin: /srv/labos            # dossier des labos sauvegardés
+  chemin_iso: /srv/labos/iso    # dossier des images ISO (modifiable depuis l'interface)
+
+defaut:                          # valeurs communes à tous les serveurs (surchargeables par serveur)
+  utilisateur: formateur
+  mot_de_passe: "ChangeMoi"
+  # mot_de_passe_root: "MdpRoot"   # facultatif, voir ci-dessus
+  images: /var/lib/libvirt/images/labos
+  isos: /var/lib/libvirt/images/iso      # où les ISO sont copiées sur les PC
+
+hotes:
+  - nom: srv01
+    ip: 192.168.100.11
+    pools: [atelier-reseau, salle-a]
+  - nom: srv02
+    ip: 192.168.100.12
+    pools: [atelier-reseau, salle-a]
+  - nom: srv03
+    ip: 192.168.100.13
+    pools: [atelier-linux, salle-b]
+  - nom: srv04
+    ip: 192.168.100.14
+    pools: [atelier-linux, salle-b]
+    utilisateur: admin           # exemple de valeur propre à un serveur
+    mot_de_passe: "AutreMdp"
+    # mot_de_passe_root: "RootSrv04"

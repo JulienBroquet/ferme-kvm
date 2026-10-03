@@ -1,0 +1,10 @@
+# Configuration réelle : contient des mots de passe, ne jamais la publier
+ferme.yaml
+*.yaml.tmp
+
+# Python
+__pycache__/
+*.pyc
+
+# Journaux et fichiers temporaires
+*.log
