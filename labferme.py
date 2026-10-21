@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-labferme.py — Ferme KVM 1.0.0 — Sauvegarde et déploiement de labos KVM/libvirt sur une ferme de serveurs Debian.
+labferme.py — Ferme KVM 1.1.0 — Sauvegarde et déploiement de labos KVM/libvirt sur une ferme de serveurs Debian.
 
 Un « labo » = un ou plusieurs réseaux virtuels libvirt + toutes les VM qui y sont branchées.
 
@@ -22,6 +22,9 @@ Commandes :
     iso-envoyer  Copie une ISO de ce poste vers le stockage
     iso-copier   Copie une ISO du stockage vers des serveurs et/ou ce poste
     iso-supprimer Supprime une ISO du stockage
+    stockage     Affiche ou modifie l'emplacement de stockage
+    pc-ajouter   Ajoute un PC à la ferme (ou une source d'export avec --source)
+    pc-retirer   Retire un PC de la ferme (et révoque sa clé sur le stockage)
 
 Dépendances du poste maître :  apt install python3-paramiko python3-yaml rsync
 """
@@ -54,8 +57,8 @@ try:
 except ImportError:
     sys.exit("Modules manquants : sudo apt install python3-paramiko python3-yaml")
 
-__version__ = "1.0.0"                      # version de Ferme KVM (moteur + interface)
-DATE_VERSION = "2026-10-03"
+__version__ = "1.1.0"                      # version de Ferme KVM (moteur + interface)
+DATE_VERSION = "2026-10-21"
 
 VIRSH = "virsh -q -c qemu:///system"
 NOM_CLE = "labferme"                       # ~/.ssh/labferme sur chaque machine
@@ -158,10 +161,11 @@ class Hote:
     """Une machine joignable en SSH (ou le poste local)."""
 
     def __init__(self, nom, ip, utilisateur, mot_de_passe=None, pools=(), images=IMAGES_DEFAUT, local=False,
-                 mdp_root=None):
+                 mdp_root=None, source=False):
         self.nom, self.ip, self.utilisateur = nom, ip, utilisateur
         self.mot_de_passe, self.pools, self.images, self.local = mot_de_passe, list(pools), images, local
         self.mdp_root = mdp_root      # facultatif : sert uniquement à « preparer » si le compte n'est pas sudoer
+        self.source = source          # machine d'export seulement (section « sources ») : jamais une cible
         self.chemin = None            # utilisé pour le stockage
         self.chemin_iso = None        # stockage : dossier des ISO
         self.isos = ISOS_DEFAUT       # PC : dossier où copier les ISO
@@ -171,7 +175,7 @@ class Hote:
     def clone(self):
         """Copie indépendante (sa propre connexion SSH), pour les tests en parallèle des opérations."""
         c = Hote(self.nom, self.ip, self.utilisateur, self.mot_de_passe, self.pools, self.images,
-                 self.local, self.mdp_root)
+                 self.local, self.mdp_root, self.source)
         c.chemin, c.chemin_iso, c.isos = self.chemin, self.chemin_iso, self.isos
         return c
 
@@ -361,13 +365,71 @@ def hote_local():
     return h
 
 
-def charger_config(chemin):
+class ConfigIncomplete(Erreur):
+    """Configuration sans stockage utilisable (l'interface propose de le configurer)."""
+
+
+class ConfigAbsente(ConfigIncomplete):
+    """Le fichier de configuration n'existe pas encore (l'interface propose de le créer)."""
+
+
+def lire_config(chemin):
+    """Contenu brut de ferme.yaml (dictionnaire)."""
     if not os.path.exists(chemin):
-        raise Erreur(f"Fichier de configuration introuvable : {chemin} (option -c)")
+        raise ConfigAbsente(f"Fichier de configuration introuvable : {chemin} (option -c)")
+    with open(chemin, encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+ENTETE_CONFIG = ("# Configuration de la ferme — à protéger : chmod 600 ferme.yaml\n"
+                 "# Les mots de passe ne servent qu'à « Préparer la ferme » ; ensuite tout passe par clés SSH.\n"
+                 "# mot_de_passe_root (facultatif, par PC ou dans defaut) : pour les comptes non sudoers ;\n"
+                 "# s'il est absent, l'interface le demande au moment de la préparation.\n"
+                 "# hotes : PC de la ferme (cibles des déploiements) ; sources : machines d'où l'on exporte\n"
+                 "# des labos, jamais utilisées comme cibles.\n"
+                 "# Le stockage, les PC, les sources et les pools se modifient aussi depuis l'interface.\n\n")
+
+
+def modifier_config(chemin, modification):
+    """Applique modification(cfg) au contenu de ferme.yaml puis l'enregistre (écriture atomique, droits
+    conservés, 600 pour un nouveau fichier). Crée le fichier s'il n'existe pas."""
+    existe = os.path.exists(chemin)
+    cfg = lire_config(chemin) if existe else {}
+    modification(cfg)
+    mode = (os.stat(chemin).st_mode & 0o777) if existe else 0o600
+    tmp = chemin + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(ENTETE_CONFIG)
+        yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False, default_flow_style=False)
+    os.chmod(tmp, mode)
+    os.replace(tmp, chemin)
+    return cfg
+
+
+def _hote_depuis(h, d, source=False):
+    x = Hote(h["nom"], h["ip"], h.get("utilisateur", d.get("utilisateur")),
+             h.get("mot_de_passe", d.get("mot_de_passe")), [] if source else h.get("pools", []),
+             h.get("images", d.get("images", IMAGES_DEFAUT)),
+             mdp_root=h.get("mot_de_passe_root", d.get("mot_de_passe_root")), source=source)
+    x.isos = h.get("isos", d.get("isos", ISOS_DEFAUT))
+    return x
+
+
+def charger_sources(chemin):
+    """Machines d'export (section « sources » de ferme.yaml) : jamais des cibles de déploiement."""
+    cfg = lire_config(chemin)
+    d = cfg.get("defaut", {}) or {}
+    return [_hote_depuis(h, d, source=True) for h in cfg.get("sources", []) or []]
+
+
+def charger_config(chemin):
+    cfg = lire_config(chemin)
     if os.stat(chemin).st_mode & 0o077:
         print(f"Attention : {chemin} contient des mots de passe, faites « chmod 600 {chemin} ».", file=sys.stderr)
-    with open(chemin, encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
+    if not cfg.get("stockage") or not cfg["stockage"].get("ip"):
+        raise ConfigIncomplete(f"{chemin} : section « stockage » absente ou sans adresse IP "
+                     f"(interface : clic sur le stockage → « Configurer le stockage… »)")
     s = cfg["stockage"]
     stockage = Hote("stockage", s["ip"], s.get("utilisateur", "root"), s.get("mot_de_passe"),
                     mdp_root=s.get("mot_de_passe_root"))
@@ -376,15 +438,243 @@ def charger_config(chemin):
     d = cfg.get("defaut", {}) or {}
     global ISOS_LOCAL
     ISOS_LOCAL = d.get("isos", ISOS_DEFAUT)
-    hotes = []
-    for h in cfg.get("hotes", []) or []:
-        x = Hote(h["nom"], h["ip"], h.get("utilisateur", d.get("utilisateur")),
-                 h.get("mot_de_passe", d.get("mot_de_passe")), h.get("pools", []),
-                 h.get("images", d.get("images", IMAGES_DEFAUT)),
-                 mdp_root=h.get("mot_de_passe_root", d.get("mot_de_passe_root")))
-        x.isos = h.get("isos", d.get("isos", ISOS_DEFAUT))
-        hotes.append(x)
+    hotes = [_hote_depuis(h, d) for h in cfg.get("hotes", []) or []]
     return stockage, hotes
+
+
+# --------------------------------------------------------------------------- gestion de la configuration
+
+def valider_machine(cfg, nom, ip, utilisateur, ancien=None):
+    """Vérifie un nouveau PC / une nouvelle source avant de l'écrire dans ferme.yaml.
+    ancien : nom actuel de la machine modifiée (elle-même n'est pas un doublon)."""
+    if not nom or not NOM_VALIDE.match(nom):
+        raise Erreur(f"nom invalide : « {nom} » (lettres, chiffres, . _ -, sans espace)")
+    if nom.lower() in ("local", "stockage", "maître", "maitre"):
+        raise Erreur(f"« {nom} » est un nom réservé")
+    if not ip or not re.match(r"^[A-Za-z0-9][A-Za-z0-9.:-]*$", ip):
+        raise Erreur(f"adresse invalide : « {ip} » (IP ou nom DNS)")
+    if not utilisateur and not (cfg.get("defaut") or {}).get("utilisateur"):
+        raise Erreur("compte SSH manquant (et pas de compte par défaut dans ferme.yaml)")
+    for section in ("hotes", "sources"):
+        for m in cfg.get(section, []) or []:
+            if m.get("nom") == ancien:
+                continue
+            if m.get("nom", "").lower() == nom.lower():
+                raise Erreur(f"le nom « {nom} » est déjà utilisé dans la configuration")
+            if m.get("ip") == ip:
+                raise Erreur(f"l'adresse {ip} est déjà utilisée par « {m.get('nom')} »")
+    if (cfg.get("stockage") or {}).get("ip") == ip:
+        raise Erreur(f"{ip} est l'adresse du stockage")
+
+
+def enregistrer_machine(chemin, machine, section="hotes", ancien=None):
+    """Ajoute (ancien=None) ou remplace la machine « ancien » dans la section hotes ou sources de ferme.yaml.
+    machine : dict {nom, ip, [utilisateur], [mot_de_passe], [pools], [images], [isos]} ; les clés vides et
+    les valeurs égales à « defaut » ne sont pas écrites."""
+    def appliquer(cfg):
+        d = cfg.get("defaut") or {}
+        m = {k: v for k, v in machine.items() if v not in (None, "", []) and (k in ("nom", "ip", "pools") or
+                                                                             d.get(k) != v)}
+        if section == "sources":
+            m.pop("pools", None)
+        valider_machine(cfg, m.get("nom"), m.get("ip"), m.get("utilisateur"), ancien)
+        liste = cfg.setdefault(section, []) or []
+        cfg[section] = liste
+        for i, x in enumerate(liste):
+            if ancien is not None and x.get("nom") == ancien:
+                # garde les clés non gérées par l'interface (mot_de_passe_root…), sauf celles redéfinies
+                garde = {k: v for k, v in x.items() if k not in ("nom", "ip", "utilisateur", "mot_de_passe",
+                                                                  "pools", "images", "isos")}
+                if "mot_de_passe" not in machine and "mot_de_passe" in x:
+                    garde["mot_de_passe"] = x["mot_de_passe"]
+                liste[i] = {**m, **garde}
+                return
+        if ancien is not None:
+            raise Erreur(f"« {ancien} » introuvable dans la section {section} de la configuration")
+        liste.append(m)
+    modifier_config(chemin, appliquer)
+    log("config", f"{'PC' if section == 'hotes' else 'source'} « {machine['nom']} » "
+                  f"{'modifié' if ancien else 'ajouté'} ({machine['ip']})", "succes")
+
+
+def supprimer_machine(chemin, nom, section="hotes"):
+    """Retire une machine de ferme.yaml (ne touche ni aux VM ni aux clés : voir revoquer_machine)."""
+    def appliquer(cfg):
+        avant = cfg.get(section) or []
+        cfg[section] = [x for x in avant if x.get("nom") != nom]
+        if len(cfg[section]) == len(avant):
+            raise Erreur(f"« {nom} » introuvable dans la section {section} de la configuration")
+    modifier_config(chemin, appliquer)
+    log("config", f"« {nom} » retiré de la configuration", "succes")
+
+
+def enregistrer_stockage(chemin, ip, utilisateur, mot_de_passe, dossier, dossier_iso):
+    """Écrit la section stockage de ferme.yaml (mot_de_passe=None : inchangé ; "" : effacé).
+    Crée le fichier (chmod 600) s'il n'existe pas, avec une section defaut minimale."""
+    def appliquer(cfg):
+        s = cfg.get("stockage") or {}
+        s.update({"ip": ip, "utilisateur": utilisateur, "chemin": dossier.rstrip("/"),
+                  "chemin_iso": (dossier_iso or dossier.rstrip("/") + "/iso").rstrip("/")})
+        if mot_de_passe == "":
+            s.pop("mot_de_passe", None)
+        elif mot_de_passe is not None:
+            s["mot_de_passe"] = mot_de_passe
+        ordre = ("ip", "utilisateur", "mot_de_passe", "chemin", "chemin_iso")
+        cfg["stockage"] = {**{k: s[k] for k in ordre if k in s}, **{k: v for k, v in s.items() if k not in ordre}}
+        cfg.setdefault("defaut", {"images": IMAGES_DEFAUT, "isos": ISOS_DEFAUT})
+        cfg.setdefault("hotes", [])
+        reste = {k: v for k, v in cfg.items() if k not in ("stockage", "defaut", "hotes", "sources")}
+        nouveau = {"stockage": cfg["stockage"], "defaut": cfg["defaut"], "hotes": cfg["hotes"]}
+        if cfg.get("sources"):
+            nouveau["sources"] = cfg["sources"]
+        cfg.clear()
+        cfg.update({**nouveau, **reste})
+    modifier_config(chemin, appliquer)
+    log("config", f"stockage : {utilisateur}@{ip}:{dossier} (ISO : {dossier_iso})", "succes")
+
+
+def tester_stockage(ip, utilisateur, mot_de_passe, dossier, dossier_iso, creer=False):
+    """Teste un emplacement de stockage avant de l'enregistrer. Renvoie une liste de (étape, ok, détail).
+    creer=True : crée les dossiers absents."""
+    res = []
+    try:
+        socket.create_connection((ip, 22), timeout=5).close()
+        res.append(("port SSH 22 joignable", True, ip))
+    except OSError as e:
+        res.append(("port SSH 22 joignable", False, f"{ip} : {e}"))
+        return res
+    h = Hote("stockage", ip, utilisateur, mot_de_passe or None)
+    try:
+        try:
+            h.run("true")
+            res.append(("connexion SSH", True, f"{utilisateur}@{ip}"))
+        except Erreur as e:
+            res.append(("connexion SSH", False, f"{e}" + ("" if mot_de_passe else
+                                                         "\nIndiquez le mot de passe du compte.")))
+            return res
+        ok = h.run("command -v rsync", verifier=False)[0] == 0
+        res.append(("rsync installé", ok, "OK" if ok else "rsync absent (Synology : activer le service rsync)"))
+        for etiquette, d in (("dossier des labos", dossier), ("dossier des ISO", dossier_iso)):
+            if not d or not d.startswith("/"):
+                res.append((etiquette, False, f"« {d} » : indiquez un chemin complet (commençant par /)"))
+                continue
+            existe = h.run(f"test -d {q(d)}", verifier=False)[0] == 0
+            if not existe and creer:
+                existe = h.run(f"mkdir -p {q(d)}", verifier=False)[0] == 0
+            if not existe:
+                parent_ok = h.run(f"p={q(d)}; while [ ! -d \"$p\" ]; do p=$(dirname \"$p\"); done; test -w \"$p\"",
+                                  verifier=False)[0] == 0
+                res.append((etiquette, parent_ok, f"{d} n'existe pas encore : " +
+                            ("il sera créé à l'enregistrement" if parent_ok else
+                             f"impossible de le créer avec le compte « {utilisateur} »")))
+                continue
+            ecriture = h.run(f"test -w {q(d)}", verifier=False)[0] == 0
+            texte = d if ecriture else f"{d} n'est pas modifiable par « {utilisateur} »"
+            if ecriture and etiquette == "dossier des labos":
+                n = lignes(h.sortie(f"cd {q(d)} && for x in */; do [ -f \"$x/labo.json\" ] && echo x; done; true",
+                                    verifier=False))
+                libre = espace_libre(h, d)
+                texte += f" – {len(n)} labo(s), {taille_lisible(libre) if libre is not None else '?'} libres"
+            res.append((etiquette, ecriture, texte))
+    finally:
+        h.fermer()
+    return res
+
+
+def revoquer_machine(stockage, h, nettoyer=False):
+    """Coupe les accès Ferme KVM d'une machine retirée de la ferme.
+    1. Sur le stockage : retire sa clé publique de authorized_keys (par commentaire et, si la machine
+       répond, par contenu exact).
+    2. nettoyer=True et machine joignable : supprime sur elle la règle sudo labferme, sa clé ~/.ssh/labferme
+       et les clés « labferme-… » de authorized_keys (en dernier : l'accès de ce poste est alors coupé).
+    Les VM, disques et réseaux de la machine ne sont jamais touchés. Renvoie une liste de messages."""
+    faits = []
+    pub, joignable = None, False
+    c = h.clone()
+    try:
+        try:
+            pub = c.sortie(f"cat {q(c.cle)}.pub 2>/dev/null", verifier=False).strip() or None
+            joignable = True
+        except Erreur as e:
+            detail(h.nom, f"machine injoignable pendant la révocation : {e}")
+        commentaire = nom_cle(c)
+        script = ("f=~/.ssh/authorized_keys; [ -f \"$f\" ] || exit 0; "
+                  f"awk -v c={q(commentaire)} -v k={q(pub or '')} "
+                  "'$NF != c && (k == \"\" || $0 != k)' \"$f\" > \"$f.labferme\" && "
+                  "n=$(( $(wc -l < \"$f\") - $(wc -l < \"$f.labferme\") )) && "
+                  "cat \"$f.labferme\" > \"$f\" && rm -f \"$f.labferme\" && echo $n")
+        n = stockage.sortie(script).strip() or "0"
+        faits.append(f"stockage : {n} clé(s) « {commentaire} » retirée(s)")
+        log(h.nom, faits[-1], "succes")
+        if nettoyer:
+            if not joignable:
+                faits.append(f"{h.nom} injoignable : rien n'a été nettoyé sur la machine")
+                log(h.nom, faits[-1], "alerte")
+                return faits
+            regle = f"/etc/sudoers.d/labferme-{re.sub(r'[^A-Za-z0-9_-]', '_', c.utilisateur)}"
+            if not c.root:
+                rc = c.run(f"sudo -n /usr/bin/rm -f {q(regle)}", verifier=False)[0]
+                faits.append(f"{h.nom} : règle sudo {regle} " + ("supprimée" if rc == 0 else
+                                                                  "non supprimée (droits insuffisants)"))
+            c.run(f"rm -f {q(c.cle)} {q(c.cle)}.pub", verifier=False)
+            faits.append(f"{h.nom} : clé ~/.ssh/{NOM_CLE} supprimée")
+            c.run("f=~/.ssh/authorized_keys; [ -f \"$f\" ] && awk '$NF !~ /^labferme-/' \"$f\" > \"$f.labferme\" "
+                  "&& cat \"$f.labferme\" > \"$f\"; rm -f \"$f.labferme\"", verifier=False)
+            faits.append(f"{h.nom} : clés « labferme-… » retirées de authorized_keys "
+                         f"(les groupes libvirt/kvm du compte sont conservés)")
+            for m in faits[-3:]:
+                log(h.nom, m, "succes")
+    finally:
+        c.fermer()
+    return faits
+
+
+def source_prete(h, stockage):
+    """Une machine peut-elle exporter un labo ? Renvoie (prête, raison).
+    Il faut : connexion SSH (clé de ce poste), droits complets sur libvirt et les disques (root ou règle sudo),
+    et sa propre clé autorisée sur le stockage."""
+    if h.local:
+        couleur, _, det = sonder_local(h)
+        return couleur == "vert", det
+    try:
+        h._mode = None
+        if h.mode not in ("root", "sudo"):
+            return False, (f"le compte « {h.utilisateur} » accède à libvirt par le groupe libvirt seulement : "
+                           f"il ne peut pas lire les disques des VM")
+        if h.run("command -v rsync && command -v qemu-img", verifier=False)[0] != 0:
+            return False, "rsync ou qemu-img absent"
+        etapes = tester_acces_stockage(h, stockage)
+        rate = [f"{e} : {d}" for e, ok, d in etapes[:2] if not ok]
+        if rate or len(etapes) < 2:
+            return False, "; ".join(rate) or "clé SSH absente"
+        return True, f"prête (droits via {LIBELLES_MODE[h.mode]})"
+    except ErreurConnexion as e:
+        return False, str(e)
+    except ErreurDroits as e:
+        return False, str(e)
+
+
+def preparer_source(stockage, h, demander_root=None):
+    """Prépare une machine (PC de la ferme, source d'export ou autre) pour qu'elle puisse exporter :
+    clé de ce poste autorisée sur elle, sa clé autorisée sur le stockage, règle sudo + groupes libvirt.
+    Contrairement à « preparer », la clé du stockage n'est PAS autorisée sur elle (inutile pour exporter)."""
+    log(h.nom, "préparation pour l'export…")
+    pub_poste = creer_cle(hote_local())
+    autoriser_cles(h, [pub_poste])
+    pub = creer_cle(h)
+    autoriser_cles(stockage, [pub])
+    log(h.nom, "clé SSH autorisée sur le stockage")
+    pret = droits_ok(h) and h.mode in ("root", "sudo") and \
+        h.run("command -v rsync && command -v qemu-img", verifier=False)[0] == 0
+    if not pret:
+        executer_en_root(h, script_preparation(h, False), demander_root)
+    h._mode = None
+    h.fermer()                                  # nouvelle session : prise en compte des groupes
+    ok, raison = source_prete(h, stockage)
+    log(h.nom, f"{'OK' if ok else 'incomplet'} – {raison}", "succes" if ok else "alerte")
+    if not ok:
+        raise Erreur(f"{h.nom} : préparation incomplète – {raison}")
+    return raison
 
 
 def choisir_hotes(hotes, args, tous_par_defaut=False):
@@ -702,6 +992,8 @@ def nom_cle(h):
     """Commentaire de la clé (visible dans authorized_keys) : labferme-<pc> ou labferme-poste-<compte>-<machine>."""
     if h.local:
         return f"labferme-poste-{propre(getpass.getuser())}-{propre(socket.gethostname())}"
+    if h.source:
+        return f"labferme-source-{propre(h.nom)}"
     return f"labferme-{propre(h.nom)}"
 
 
@@ -734,6 +1026,18 @@ def script_preparation(h, est_stockage, chemin=None):
 
 def cmd_preparer(args, stockage, hotes):
     demander_root = getattr(args, "demander_root", None)
+    sources = {h.nom: h for h in getattr(args, "sources", ())}
+    a_sources = [sources[n] for n in (args.hote or []) if n in sources]
+    if a_sources:                               # --hote NOM d'une source d'export : préparation pour l'export
+        for h in a_sources:
+            try:
+                preparer_source(stockage, h, demander_root)
+            except Exception as e:
+                log(h.nom, f"ÉCHEC : {e}")
+                detail(h.nom, traceback.format_exc())
+        args.hote = [n for n in args.hote if n not in sources]
+        if not args.hote and not args.pool and not args.tous:
+            return
     local = hote_local()
     local.mot_de_passe = getattr(args, "mdp_local", None)
     local.mdp_root = getattr(args, "mdp_local", None)
@@ -1108,12 +1412,21 @@ def copier_vers(src, chemin, destination, ssh_e):
     return fmt
 
 
+def trouver_machine(nom, hotes, sources=()):
+    """PC de la ferme ou source d'export, par nom ou IP."""
+    for h in list(hotes) + list(sources):
+        if nom in (h.nom, h.ip):
+            return h
+    raise Erreur(f"machine « {nom} » absente de la configuration (ni PC de la ferme, ni source d'export)")
+
+
 def cmd_sauvegarder(args, stockage, hotes):
-    if args.hote:
-        trouve = [h for h in hotes if args.hote in (h.nom, h.ip)]
-        if not trouve:
-            raise Erreur(f"serveur « {args.hote} » absent de la configuration")
-        src = trouve[0]
+    """Exporte un labo vers le stockage depuis : args.source (Hote déjà construit, ex. machine saisie dans
+    l'interface), sinon --hote (PC de la ferme ou source d'export de ferme.yaml), sinon ce poste."""
+    if getattr(args, "source", None) is not None:
+        src = args.source
+    elif args.hote:
+        src = trouver_machine(args.hote, hotes, getattr(args, "sources", ()))
     else:
         src = hote_local()
     p = src.nom
@@ -1642,7 +1955,7 @@ def construire_parser():
     s.add_argument("-n", "--nom", help="nom du labo sur le stockage (défaut : nom du 1er réseau)")
     s.add_argument("--proprietaire", help="enseignant responsable (défaut : utilisateur courant)")
     s.add_argument("--description")
-    s.add_argument("--hote", help="sauvegarder depuis ce serveur de la ferme au lieu de ce poste")
+    s.add_argument("--hote", help="sauvegarder depuis ce PC de la ferme ou cette source d'export au lieu de ce poste")
     s.add_argument("--arreter", action="store_true", help="éteindre proprement les VM allumées puis les relancer")
     s.add_argument("--laisser-eteint", action="store_true", help="avec --arreter : ne pas relancer les VM")
     s.add_argument("--ecraser", action="store_true", help="remplacer une sauvegarde existante du même nom")
@@ -1672,13 +1985,73 @@ def construire_parser():
     s.add_argument("--local", action="store_true", help="copier aussi sur ce poste")
     s = sub.add_parser("iso-supprimer", help="supprimer une ISO du stockage")
     s.add_argument("nom")
+
+    s = sub.add_parser("stockage", help="afficher ou modifier l'emplacement de stockage")
+    s.add_argument("--ip", help="adresse du serveur de stockage")
+    s.add_argument("--utilisateur", help="compte SSH sur le stockage")
+    s.add_argument("--mot-de-passe", action="store_true", help="demander et enregistrer le mot de passe du compte")
+    s.add_argument("--chemin", help="dossier des labos")
+    s.add_argument("--chemin-iso", help="dossier des ISO (défaut : <chemin>/iso)")
+    s.add_argument("--forcer", action="store_true", help="enregistrer même si le test échoue")
+
+    s = sub.add_parser("pc-ajouter", help="ajouter un PC à la ferme (ou une source d'export avec --source)")
+    s.add_argument("nom")
+    s.add_argument("ip")
+    s.add_argument("--utilisateur", help="compte SSH (défaut : celui de « defaut »)")
+    s.add_argument("--mot-de-passe", action="store_true", help="demander et enregistrer le mot de passe du compte")
+    s.add_argument("--pool", action="append", metavar="NOM", help="pool du PC (répétable)")
+    s.add_argument("--images", help="dossier des disques sur le PC (défaut : celui de « defaut »)")
+    s.add_argument("--source", action="store_true",
+                   help="machine d'export seulement (jamais une cible de déploiement)")
+
+    s = sub.add_parser("pc-retirer", help="retirer un PC (ou une source d'export) de la configuration")
+    s.add_argument("nom")
+    s.add_argument("--garder-cle", action="store_true", help="ne pas révoquer sa clé SSH sur le stockage")
+    s.add_argument("--nettoyer", action="store_true",
+                   help="supprimer aussi sur la machine la règle sudo et les clés Ferme KVM (VM conservées)")
     return p
+
+
+def cmd_stockage(args, stockage, hotes):
+    if not any((args.ip, args.utilisateur, args.chemin, args.chemin_iso, args.mot_de_passe)):
+        print(f"{stockage.utilisateur}@{stockage.ip}\n  labos : {stockage.chemin}\n  ISO   : {stockage.chemin_iso}")
+        return
+    ip, util = args.ip or stockage.ip, args.utilisateur or stockage.utilisateur
+    chemin = (args.chemin or stockage.chemin).rstrip("/")
+    iso_suit = not stockage.chemin_iso or stockage.chemin_iso == f"{stockage.chemin}/iso"   # ISO = <labos>/iso
+    chemin_iso = (args.chemin_iso or (chemin + "/iso" if iso_suit else stockage.chemin_iso)).rstrip("/")
+    mdp = getpass.getpass(f"Mot de passe de {util}@{ip} : ") if args.mot_de_passe else None
+    res = tester_stockage(ip, util, mdp or stockage.mot_de_passe, chemin, chemin_iso, creer=True)
+    for etape, ok, det in res:
+        log("stockage", f"{'OK' if ok else 'ÉCHEC'} – {etape} : {det}", "succes" if ok else "erreur")
+    if not all(ok for _, ok, _ in res) and not args.forcer:
+        raise Erreur("stockage non enregistré (corrigez le problème ou ajoutez --forcer)")
+    enregistrer_stockage(args.config, ip, util, mdp, chemin, chemin_iso)
+    if (ip, util) != (stockage.ip, stockage.utilisateur):
+        log("stockage", "nouveau serveur : lancez « preparer » pour y installer les clés SSH de la ferme", "alerte")
+
+
+def cmd_pc_ajouter(args, stockage, hotes):
+    machine = {"nom": args.nom, "ip": args.ip, "utilisateur": args.utilisateur, "pools": args.pool or [],
+               "images": args.images}
+    if args.mot_de_passe:
+        machine["mot_de_passe"] = getpass.getpass(f"Mot de passe de {args.utilisateur or 'ce compte'}@{args.ip} : ")
+    enregistrer_machine(args.config, machine, "sources" if args.source else "hotes")
+    log(args.nom, f"lancez « preparer --hote {args.nom} » pour installer les clés et les droits", "info")
+
+
+def cmd_pc_retirer(args, stockage, hotes):
+    h = trouver_machine(args.nom, hotes, getattr(args, "sources", ()))
+    if not args.garder_cle:
+        revoquer_machine(stockage, h, nettoyer=args.nettoyer)
+    supprimer_machine(args.config, h.nom, "sources" if h.source else "hotes")
 
 
 COMMANDES = {"preparer": cmd_preparer, "lister": cmd_lister, "inventaire": cmd_inventaire,
              "sauvegarder": cmd_sauvegarder, "deployer": cmd_deployer, "retirer": cmd_retirer,
              "isos": cmd_isos, "iso-envoyer": cmd_iso_envoyer, "iso-copier": cmd_iso_copier,
-             "iso-supprimer": cmd_iso_supprimer}
+             "iso-supprimer": cmd_iso_supprimer, "stockage": cmd_stockage, "pc-ajouter": cmd_pc_ajouter,
+             "pc-retirer": cmd_pc_retirer}
 
 
 def main():
@@ -1686,7 +2059,15 @@ def main():
     init_journal()
     detail("cli", f"Ferme KVM {__version__} – " + " ".join(sys.argv))
     try:
-        stockage, hotes = charger_config(args.config)
+        if args.commande == "stockage" and not os.path.exists(args.config):
+            if not (args.ip and args.utilisateur and args.chemin):
+                raise Erreur(f"{args.config} n'existe pas : indiquez --ip, --utilisateur et --chemin pour le créer")
+            stockage = Hote("stockage", args.ip, args.utilisateur)
+            stockage.chemin, stockage.chemin_iso = args.chemin.rstrip("/"), args.chemin_iso
+            hotes = []
+        else:
+            stockage, hotes = charger_config(args.config)
+        args.sources = charger_sources(args.config) if os.path.exists(args.config) else []
         res = COMMANDES[args.commande](args, stockage, hotes)
         if isinstance(res, tuple) and res[1]:
             sys.exit(1)

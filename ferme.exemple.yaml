@@ -34,3 +34,11 @@ hotes:
     utilisateur: admin           # exemple de valeur propre à un serveur
     mot_de_passe: "AutreMdp"
     # mot_de_passe_root: "RootSrv04"
+
+# Machines d'où l'on exporte des labos (poste d'un collègue, PC de préparation…) : jamais des cibles de
+# déploiement. Facultatif ; se gère aussi depuis l'interface (fenêtre d'export → « + Autre machine… »).
+sources:
+  - nom: poste-collegue
+    ip: 192.168.100.50
+    utilisateur: collegue
+    mot_de_passe: "ChangeMoi"

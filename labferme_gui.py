@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-labferme_gui.py — Ferme KVM 1.0.0 — Interface graphique de labferme.py (même dossier).
+labferme_gui.py — Ferme KVM 1.1.0 — Interface graphique de labferme.py (même dossier).
 
     sudo apt install python3-tk python3-paramiko python3-yaml rsync
     python3 labferme_gui.py [-c ferme.yaml]
 
 - Labos du serveur de stockage : lus au démarrage et via « Rafraîchir ».
-- Serveurs de la ferme : cocher des PC, charger un pool, enregistrer la sélection comme pool.
+- Serveurs de la ferme : cocher des PC, charger un pool, enregistrer la sélection comme pool ;
+  ajouter, modifier ou retirer un PC.
+- Stockage : emplacement (serveur, compte, dossiers) configurable et testable depuis l'interface.
 - Déployer / retirer le labo choisi sur les PC cochés.
-- Exporter un labo de ce poste vers le stockage (choix parmi les réseaux virtuels locaux).
+- Exporter un labo vers le stockage depuis ce poste, un PC de la ferme ou une autre machine (source).
 - Voyants : état des PC testé au démarrage puis automatiquement (vert / orange / rouge).
 - ISO : bibliothèque d'images ISO sur le stockage, copie vers les PC cochés ou ce poste.
 - Journal : fichier ~/.local/state/labferme/labferme.log, consultable via « Journal complet ».
@@ -34,15 +36,9 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import labferme as L  # noqa: E402
 
-import yaml  # noqa: E402
 
 COCHE, VIDE = "☑", "☐"
 LOCAL = "__local__"            # ligne spéciale « Ce poste » dans la liste des serveurs
-ENTETE_CONFIG = ("# Configuration de la ferme — à protéger : chmod 600 ferme.yaml\n"
-                 "# Les mots de passe ne servent qu'à « Préparer la ferme » ; ensuite tout passe par clés SSH.\n"
-                 "# mot_de_passe_root (facultatif, par PC ou dans defaut) : pour les comptes non sudoers ;\n"
-                 "# s'il est absent, l'interface le demande au moment de la préparation.\n"
-                 "# Les pools peuvent être modifiés depuis l'interface graphique.\n\n")
 COULEURS = {"vert": ("#2ea043", "#1a7f37"), "orange": ("#e3a008", "#9a6700"),
             "rouge": ("#e5534b", "#a40e26"), "gris": ("#b0b0b0", "#808080")}
 INTERVALLES = {"30 s": 30, "1 min": 60, "2 min": 120, "5 min": 300}
@@ -190,7 +186,7 @@ class Application(tk.Tk):
             except tk.TclError:
                 pass
         self.chemin_config = os.path.abspath(chemin_config)
-        self.stockage, self.hotes = None, []
+        self.stockage, self.hotes, self.sources = None, [], []
         self.labos = {}                      # nom -> manifeste
         self.coches = set()                  # noms des serveurs cochés
         self.etats = {}                      # nom serveur -> (couleur, texte, détail, heure)
@@ -373,8 +369,8 @@ class Application(tk.Tk):
                                      fg=T["nav_texte"], anchor="w", justify="left", wraplength=180, cursor="hand2",
                                      font=(self.police, 9), padx=0)
         self.lbl_stockage.pack(fill="x", pady=(2, 12))
-        self.lbl_stockage.bind("<Button-1>", lambda e: self.details_stockage())
-        Infobulle(self.lbl_stockage, "Cliquer : état du stockage et test d'accès SSH + rsync")
+        self.lbl_stockage.bind("<Button-1>", self._menu_stockage)
+        Infobulle(self.lbl_stockage, "Cliquer : configurer l'emplacement de stockage, voir son état, tester l'accès")
         tk.Label(bas, text="Ferme", bg=T["nav"], fg=T["nav_doux"], font=(self.police, 9), anchor="w").pack(fill="x")
         self.lbl_resume_nav = tk.Label(bas, text="", bg=T["nav"], fg=T["nav_texte"], anchor="w", justify="left",
                                        font=(self.police, 9))
@@ -485,9 +481,10 @@ class Application(tk.Tk):
         b = ttk.Button(actions, text="Retirer…", style="Danger.TButton", command=self.retirer)
         b.pack(side="left", padx=8)
         Infobulle(b, "Supprime les VM, disques et réseaux de ce labo sur les PC cochés")
-        b = ttk.Button(actions, text="Exporter depuis ce poste…", command=self.ouvrir_export)
+        b = ttk.Button(actions, text="Exporter un labo…", command=self.ouvrir_export)
         b.pack(side="right")
-        Infobulle(b, "Envoie un labo (réseau + VM) de cette machine vers le stockage")
+        Infobulle(b, "Envoie un labo (réseau + VM) vers le stockage, depuis ce poste, un PC de la ferme "
+                     "ou une autre machine")
 
         opts = self.carte(page, side="bottom", fill="x", pady=(10, 0))
         ttk.Label(opts, text="Options de déploiement", style="Section.TLabel").grid(row=0, column=0, columnspan=2,
@@ -615,8 +612,11 @@ class Application(tk.Tk):
         tete = ttk.Frame(f, style="Carte.TFrame")
         tete.pack(fill="x")
         ttk.Label(tete, text="PC de la ferme", style="Section.TLabel").pack(side="left")
+        b = ttk.Button(tete, text="+ Ajouter un PC…", style="Outil.TButton", command=self.ajouter_pc)
+        b.pack(side="right")
+        Infobulle(b, "Ajouter un PC à la ferme (enregistré dans ferme.yaml, puis préparé si vous le souhaitez)")
         self.lbl_coches = ttk.Label(tete, text="", style="CarteDoux.TLabel")
-        self.lbl_coches.pack(side="right")
+        self.lbl_coches.pack(side="right", padx=(0, 10))
 
         outils = ttk.Frame(f, style="Carte.TFrame")
         outils.pack(fill="x", pady=(10, 6))
@@ -882,7 +882,9 @@ class Application(tk.Tk):
     def charger_config(self):
         if self.stockage:
             self.stockage.fermer()
+        self.stockage = None
         self.stockage, self.hotes = L.charger_config(self.chemin_config)
+        self.sources = L.charger_sources(self.chemin_config)
         noms = {h.nom for h in self.hotes}
         self.coches &= noms
         self.etats = {n: e for n, e in self.etats.items() if n in noms or n == LOCAL}
@@ -895,7 +897,18 @@ class Application(tk.Tk):
     def recharger_tout(self):
         try:
             self.charger_config()
+        except L.ConfigIncomplete as e:
+            self._sans_stockage()
+            L.log("config", str(e), "alerte")
+            absent = isinstance(e, L.ConfigAbsente)
+            if messagebox.askyesno("Configuration",
+                                   (f"Le fichier {self.chemin_config} n'existe pas encore." if absent else str(e))
+                                   + "\n\nConfigurer maintenant l'emplacement de stockage des labos ?"
+                                   + ("\nLe fichier sera créé (chmod 600)." if absent else "")):
+                FenetreStockage(self)
+            return
         except Exception as e:
+            self._sans_stockage()
             L.log("ERREUR", f"configuration : {e}")
             messagebox.showerror("Configuration", str(e))
             return
@@ -1188,6 +1201,10 @@ class Application(tk.Tk):
                       command=lambda: self.tester_acces(next(h for h in self.hotes if h.nom == iid), iid))
         m.add_separator()
         m.add_command(label="Préparer ce PC…", command=lambda: self.preparer(noms=[iid]))
+        m.add_separator()
+        m.add_command(label="Modifier ce PC…", command=lambda: self.modifier_pc(iid))
+        m.add_command(label="Retirer de la ferme…", foreground=T["danger"], activeforeground=T["danger"],
+                      command=lambda: self.retirer_pc(iid))
         m.tk_popup(event.x_root, event.y_root)
 
     def tester_acces(self, h, titre):
@@ -1357,16 +1374,7 @@ class Application(tk.Tk):
 
     def _modifier_config(self, modification):
         """Applique modification(cfg) au contenu de ferme.yaml puis l'enregistre et le recharge."""
-        with open(self.chemin_config, encoding="utf-8") as f:
-            cfg = yaml.safe_load(f)
-        modification(cfg)
-        mode = os.stat(self.chemin_config).st_mode & 0o777
-        tmp = self.chemin_config + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(ENTETE_CONFIG)
-            yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False, default_flow_style=False)
-        os.chmod(tmp, mode)
-        os.replace(tmp, self.chemin_config)
+        L.modifier_config(self.chemin_config, modification)
         self.charger_config()
 
     def tester_serveurs(self):
@@ -1498,9 +1506,12 @@ class Application(tk.Tk):
         self.tache("Préparation de ce poste",
                    lambda: L.preparer_local(self.stockage, mdp, self._demander_root), fin)
 
-    def preparer(self, noms=None):
+    def preparer(self, noms=None, confirmer=True, suite=None):
+        if not self.stockage:
+            messagebox.showinfo("Préparer", "Configurez d'abord le stockage (clic sur « Stockage », barre latérale).")
+            return
         cibles = [h for h in self.hotes if h.nom in noms] if noms else (self.pc_coches() or self.hotes)
-        if not messagebox.askyesno(
+        if confirmer and not messagebox.askyesno(
                 "Préparer",
                 "Cette opération utilise les mots de passe de la configuration pour :\n"
                 "• installer les clés SSH (poste maître ↔ stockage ↔ serveurs),\n"
@@ -1517,26 +1528,112 @@ class Application(tk.Tk):
             self._root_commun = None
             messagebox.showinfo("Préparation", "Préparation terminée (voir le journal).")
             self.surveiller(manuel=True)
+            if suite:
+                suite()
 
         self.tache("Préparation", lambda: L.cmd_preparer(args, self.stockage, self.hotes), fin)
 
-    def ouvrir_export(self):
+    def ouvrir_export(self, source=None):
         if not self.stockage:
+            messagebox.showinfo("Exporter", "Configurez d'abord le stockage (clic sur « Stockage », barre latérale).")
             return
-        self.assurer_droits_locaux(lambda: self.tache(
-            "Lecture des labos de ce poste", lambda: L.labos_locaux(L.hote_local()),
-            lambda reseaux: FenetreExport(self, reseaux)))
+        FenetreExport(self, source)
 
-    def exporter(self, args):
+    def exporter(self, args, parent=None):
         existe = args.nom in self.labos
         if existe and not messagebox.askyesno("Exporter", f"Le labo « {args.nom} » existe déjà sur le stockage.\n"
-                                                          "Le remplacer par cette nouvelle version ?"):
+                                                          "Le remplacer par cette nouvelle version ?", parent=parent):
             return False
         args.ecraser = existe
-        self.tache(f"Export de {args.nom}", lambda: L.cmd_sauvegarder(args, self.stockage, self.hotes),
-                   lambda r: (messagebox.showinfo("Export", f"Labo « {args.nom} » exporté sur le stockage."),
+        src = args.source
+        quoi = "ce poste" if src is None else src.nom
+
+        def travail():
+            try:
+                return L.cmd_sauvegarder(args, self.stockage, self.hotes)
+            finally:
+                if src is not None:
+                    src.fermer()
+
+        self.tache(f"Export de {args.nom} depuis {quoi}", travail,
+                   lambda r: (messagebox.showinfo("Export", f"Labo « {args.nom} » exporté sur le stockage "
+                                                            f"depuis {quoi}."),
                               self.rafraichir_labos()))
         return True
+
+    def preparer_source(self, h, suite=None, parent=None):
+        """Prépare une source d'export (ou une autre machine) : clés + droits, sans toucher au reste de la ferme."""
+        mdp = h.mot_de_passe
+        if not mdp:
+            mdp = simpledialog.askstring(
+                "Mot de passe", f"Préparation de {h.nom} ({h.ip}) pour l'export.\n\n"
+                                f"Mot de passe du compte « {h.utilisateur} » sur cette machine\n"
+                                f"(sert à installer la clé SSH et les droits ; il n'est pas enregistré).\n"
+                                f"Laissez vide si la clé SSH de ce poste y est déjà installée :",
+                show="•", parent=parent or self)
+            if mdp is None:
+                return
+        c = h.clone()
+        c.mot_de_passe = mdp or None
+        self._root_commun = None
+
+        def travail():
+            try:
+                return L.preparer_source(self.stockage, c, self._demander_root)
+            finally:
+                c.fermer()
+
+        def fin(raison):
+            self._root_commun = None
+            messagebox.showinfo("Préparation", f"{h.nom} est prête pour l'export : {raison}.", parent=parent or self)
+            if suite:
+                suite()
+
+        self.tache(f"Préparation de {h.nom}", travail, fin)
+
+    # ------------------------------------------------------------------ gestion des PC, sources et stockage
+
+    def _sans_stockage(self):
+        self.stockage, self.hotes, self.sources = None, [], []
+        self.lbl_stockage.configure(text=" non configuré\n cliquer pour configurer", image=self.pastilles["gris"])
+        self.lbl_config.configure(text=os.path.basename(self.chemin_config))
+        self.afficher_serveurs()
+
+    def _menu_stockage(self, event):
+        m = tk.Menu(self, tearoff=0)
+        m.add_command(label="Configurer le stockage…", command=lambda: FenetreStockage(self))
+        if self.stockage:
+            m.add_command(label="État du stockage…", command=self.details_stockage)
+            m.add_command(label="Tester l'accès depuis ce poste (SSH + rsync)",
+                          command=lambda: self.tester_acces(L.hote_local(), "Ce poste"))
+        m.tk_popup(event.x_root, event.y_root)
+
+    def ajouter_pc(self):
+        if not self.stockage:
+            messagebox.showinfo("Ajouter un PC", "Configurez d'abord le stockage (clic sur « Stockage », "
+                                                 "barre latérale).")
+            return
+        FenetrePC(self, "hotes")
+
+    def modifier_pc(self, nom):
+        h = next((x for x in self.hotes if x.nom == nom), None)
+        if h:
+            FenetrePC(self, "hotes", h)
+
+    def retirer_pc(self, nom, section="hotes", parent=None, suite=None):
+        h = next((x for x in (self.hotes if section == "hotes" else self.sources) if x.nom == nom), None)
+        if h:
+            FenetreRetrait(self, h, section, parent, suite)
+
+    def machine_enregistree(self, nom, ancien=None, section="hotes"):
+        """Après l'ajout ou la modification d'un PC : recharge la configuration et teste la machine."""
+        if ancien and ancien != nom:
+            if ancien in self.coches:
+                self.coches = (self.coches - {ancien}) | {nom}
+            self.etats.pop(ancien, None)
+        self.charger_config()
+        if section == "hotes":
+            self.surveiller(manuel=True, noms=[nom])
 
 
 class GraphiqueCharge(tk.Canvas):
@@ -2318,32 +2415,436 @@ class FenetreJournal(tk.Toplevel):
             self.recharger()
 
 
-class FenetreExport(tk.Toplevel):
-    """Choix d'un labo local (réseaux virtuels + VM) à exporter vers le stockage."""
+class Dialogue(tk.Toplevel):
+    """Fenêtre de saisie : titre, texte d'explication, grille « libellé / champ / aide », boutons en bas."""
 
-    def __init__(self, app, reseaux):
+    def __init__(self, app, titre, explication, parent=None, largeur=640):
+        super().__init__(parent or app)
+        self.app = app
+        self.title(titre)
+        self.transient(parent or app)
+        self.resizable(True, False)
+        self.minsize(largeur, 0)
+        self.cadre = ttk.Frame(self, padding=16)
+        self.cadre.pack(fill="both", expand=True)
+        ttk.Label(self.cadre, text=titre, font=(app.police, 13, "bold")).pack(anchor="w")
+        if explication:
+            ttk.Label(self.cadre, text=explication, style="Doux.TLabel", wraplength=largeur - 40,
+                      justify="left").pack(anchor="w", pady=(2, 12))
+        self.grille = ttk.Frame(self.cadre)
+        self.grille.pack(fill="x")
+        self.grille.columnconfigure(1, weight=1)
+        self._ligne = 0
+        self.boutons = ttk.Frame(self.cadre)
+        self.boutons.pack(side="bottom", fill="x", pady=(14, 0))
+        self.bind("<Escape>", lambda e: self.destroy())
+
+    def champ(self, libelle, variable, aide="", show=None, largeur=34):
+        ttk.Label(self.grille, text=libelle).grid(row=self._ligne, column=0, sticky="w", pady=3, padx=(0, 10))
+        e = ttk.Entry(self.grille, textvariable=variable, width=largeur, show=show)
+        e.grid(row=self._ligne, column=1, sticky="we", pady=3)
+        if aide:
+            ttk.Label(self.grille, text=aide, style="Doux.TLabel").grid(row=self._ligne, column=2, sticky="w",
+                                                                        padx=(10, 0))
+        self._ligne += 1
+        return e
+
+    def case(self, texte, variable, aide=""):
+        c = ttk.Checkbutton(self.grille, text=texte, variable=variable)
+        c.grid(row=self._ligne, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        if aide:
+            Infobulle(c, aide)
+        self._ligne += 1
+        return c
+
+    def bouton(self, texte, commande, style=None, gauche=False):
+        b = ttk.Button(self.boutons, text=texte, command=commande, **({"style": style} if style else {}))
+        b.pack(side="left" if gauche else "right", padx=(0, 6) if gauche else (6, 0))
+        return b
+
+    def centrer(self):
+        self.update_idletasks()
+        m = self.master
+        x = m.winfo_rootx() + max(0, (m.winfo_width() - self.winfo_reqwidth()) // 2)
+        y = m.winfo_rooty() + max(0, (m.winfo_height() - self.winfo_reqheight()) // 3)
+        self.geometry(f"+{x}+{y}")
+
+
+class FenetrePC(Dialogue):
+    """Ajout ou modification d'un PC de la ferme (section « hotes ») ou d'une source d'export (« sources »)."""
+
+    def __init__(self, app, section="hotes", machine=None, parent=None, suite=None):
+        self.section, self.machine, self.suite = section, machine, suite
+        pc = section == "hotes"
+        titre = ("Modifier " + machine.nom) if machine else ("Ajouter un PC à la ferme" if pc
+                                                             else "Nouvelle machine source")
+        explication = ("Le PC doit avoir Debian avec KVM/libvirt, un serveur SSH actif et une IP fixe. "
+                       "Il sera enregistré dans ferme.yaml." if pc else
+                       "Machine depuis laquelle on exporte des labos (poste d'un collègue, PC de préparation…). "
+                       "Elle n'est jamais une cible de déploiement. Il lui faut libvirt et un serveur SSH actif.")
+        super().__init__(app, titre, explication, parent)
+        try:
+            d = (L.lire_config(app.chemin_config).get("defaut") or {})
+        except Exception:
+            d = {}
+        self.defaut = d
+        self.var_nom = tk.StringVar(value=machine.nom if machine else "")
+        self.var_ip = tk.StringVar(value=machine.ip if machine else "")
+        self.var_util = tk.StringVar(value=(machine.utilisateur if machine else d.get("utilisateur", "")) or "")
+        self.var_mdp = tk.StringVar()
+        self.var_pools = tk.StringVar(value=", ".join(machine.pools) if machine else "")
+        self.var_images = tk.StringVar(value=(machine.images if machine else d.get("images", L.IMAGES_DEFAUT)))
+        self.var_preparer = tk.BooleanVar(value=machine is None)
+
+        e = self.champ("Nom :", self.var_nom, "ex. KVM-05 (lettres, chiffres, . _ -)")
+        self.champ("Adresse IP :", self.var_ip, "IP fixe ou nom DNS")
+        self.champ("Compte SSH :", self.var_util,
+                   f"défaut : {d['utilisateur']}" if d.get("utilisateur") else "sudoer ou non")
+        a_mdp = machine is not None and machine.mot_de_passe
+        self.champ("Mot de passe :", self.var_mdp,
+                   "vide = inchangé" if a_mdp else ("vide = celui par défaut" if d.get("mot_de_passe")
+                                                    else "pour la préparation"), show="•")
+        if pc:
+            existants = sorted({p for h in app.hotes for p in h.pools})
+            self.champ("Pools :", self.var_pools, "séparés par des virgules")
+            if existants:
+                ttk.Label(self.grille, text="Pools existants : " + ", ".join(existants), style="Doux.TLabel",
+                          wraplength=420).grid(row=self._ligne, column=1, columnspan=2, sticky="w")
+                self._ligne += 1
+            self.champ("Dossier des disques :", self.var_images, "sur le PC")
+        self.case("Préparer cette machine après l'enregistrement (clés SSH, droits libvirt)" if pc else
+                  "Préparer cette machine pour l'export après l'enregistrement", self.var_preparer,
+                  "Installe les clés SSH et la règle sudo ; le mot de passe root est demandé si le compte "
+                  "n'est pas sudoer.")
+        self.lbl_test = ttk.Label(self.cadre, text="", wraplength=600, justify="left", compound="left")
+        self.lbl_test.pack(anchor="w", pady=(12, 0))
+
+        self.bouton("Annuler", self.destroy)
+        self.bouton("Enregistrer", self.enregistrer, "Action.TButton")
+        self.bouton("Tester la connexion", self.tester, gauche=True)
+        self.centrer()
+        e.focus_set()
+        self.bind("<Return>", lambda ev: self.enregistrer())
+
+    def _machine(self):
+        m = {"nom": self.var_nom.get().strip(), "ip": self.var_ip.get().strip(),
+             "utilisateur": self.var_util.get().strip()}
+        if self.var_mdp.get():
+            m["mot_de_passe"] = self.var_mdp.get()
+        if self.section == "hotes":
+            m["pools"] = sorted({p.strip().replace(" ", "-") for p in self.var_pools.get().split(",") if p.strip()})
+            m["images"] = self.var_images.get().strip().rstrip("/") or None
+        return m
+
+    def _hote(self):
+        m = self._machine()
+        mdp = m.get("mot_de_passe") or (self.machine.mot_de_passe if self.machine else None) or \
+            self.defaut.get("mot_de_passe")
+        h = L.Hote(m["nom"] or "nouveau", m["ip"], m["utilisateur"] or self.defaut.get("utilisateur"), mdp,
+                   m.get("pools", []), m.get("images") or L.IMAGES_DEFAUT, source=self.section == "sources")
+        return h
+
+    def tester(self):
+        h = self._hote()
+        if not h.ip:
+            self.lbl_test.configure(text="Indiquez l'adresse IP.", image="")
+            return
+        self.lbl_test.configure(text=f"Test de {h.ip}…", image=self.app.pastilles["gris"])
+
+        def travail():
+            r = L.sonder(h)
+            self.after(0, lambda: self.winfo_exists() and self.lbl_test.configure(
+                text=f" {r[1]}\n{r[2]}", image=self.app.pastilles[r[0]]))
+        threading.Thread(target=travail, daemon=True).start()
+
+    def enregistrer(self):
+        m = self._machine()
+        ancien = self.machine.nom if self.machine else None
+        try:
+            L.enregistrer_machine(self.app.chemin_config, m, self.section, ancien)
+        except L.Erreur as e:
+            messagebox.showerror(self.title(), str(e), parent=self)
+            return
+        self.app.machine_enregistree(m["nom"], ancien, self.section)
+        preparer = self.var_preparer.get()
+        suite, section = self.suite, self.section
+        app = self.app
+        parent = self.master if self.master is not app else None
+        self.destroy()
+        if ancien and ancien != m["nom"]:
+            L.log(m["nom"], f"renommé (ancien nom : {ancien}) ; la clé SSH garde son ancien commentaire "
+                            f"« labferme-{ancien} » sur le stockage", "alerte")
+        if suite:
+            suite(m["nom"], lire=not (preparer and section == "sources"))
+        if preparer:
+            if section == "hotes":
+                app.preparer(noms=[m["nom"]], confirmer=False)
+            else:
+                h = next((x for x in app.sources if x.nom == m["nom"]), None)
+                if h:
+                    if m.get("mot_de_passe"):
+                        h.mot_de_passe = m["mot_de_passe"]
+                    app.preparer_source(h, suite=(lambda: suite(m["nom"])) if suite else None, parent=parent)
+                elif suite:
+                    suite(m["nom"])
+
+
+class FenetreRetrait(Dialogue):
+    """Retire un PC (ou une source d'export) de ferme.yaml et, au choix, révoque ses accès."""
+
+    def __init__(self, app, h, section="hotes", parent=None, suite=None):
+        self.h, self.section, self.suite = h, section, suite
+        pc = section == "hotes"
+        super().__init__(app, f"Retirer {h.nom}" + (" de la ferme" if pc else " des sources d'export"),
+                         f"{h.nom} ({h.ip}) sera retiré de ferme.yaml. Ses VM, disques et réseaux ne sont pas "
+                         f"touchés : retirez d'abord les labos si vous voulez libérer la place.", parent, 600)
+        self.var_revoquer = tk.BooleanVar(value=True)
+        self.var_nettoyer = tk.BooleanVar(value=False)
+        self.case(f"Révoquer sa clé SSH sur le stockage (« {L.nom_cle(h)} »)", self.var_revoquer,
+                  "La machine ne pourra plus lire ni écrire sur le stockage. Recommandé si elle quitte la ferme.")
+        self.case("Nettoyer aussi la machine : règle sudo et clés Ferme KVM", self.var_nettoyer,
+                  "Supprime /etc/sudoers.d/labferme-<compte>, ~/.ssh/labferme et les clés « labferme-… » de "
+                  "authorized_keys. Plus aucun poste ne pourra la piloter. Les groupes libvirt/kvm restent.")
+        ttk.Label(self.grille, text="À ne cocher que si la machine quitte définitivement Ferme KVM, "
+                                    "y compris pour les collègues qui l'utilisent.", style="Doux.TLabel",
+                  wraplength=540).grid(row=self._ligne, column=0, columnspan=3, sticky="w", padx=(24, 0))
+        self.bouton("Annuler", self.destroy)
+        self.bouton("Retirer", self.valider, "Danger.TButton")
+        self.centrer()
+
+    def valider(self):
+        app, h, section = self.app, self.h, self.section
+        revoquer, nettoyer = self.var_revoquer.get(), self.var_nettoyer.get()
+        parent = self.master if self.master is not app else None
+        suite = self.suite
+        self.destroy()
+
+        def travail():
+            if not revoquer:
+                return [], None
+            try:
+                return L.revoquer_machine(app.stockage, h, nettoyer), None
+            except Exception as e:
+                L.detail(h.nom, traceback.format_exc())
+                return [], e
+
+        def fin(res):
+            faits, erreur = res
+            try:
+                L.supprimer_machine(app.chemin_config, h.nom, section)
+            except L.Erreur as e:
+                messagebox.showerror("Retirer", str(e), parent=parent or app)
+                return
+            app.coches.discard(h.nom)
+            app.etats.pop(h.nom, None)
+            app.charger_config()
+            texte = f"{h.nom} a été retiré de la configuration."
+            if faits:
+                texte += "\n\n" + "\n".join("• " + f for f in faits)
+            if erreur:
+                texte += (f"\n\nLa clé n'a pas pu être révoquée sur le stockage : {erreur}\n"
+                          f"À faire à la main sur le stockage :\n"
+                          f"sed -i '/{L.nom_cle(h)}$/d' ~/.ssh/authorized_keys")
+            (messagebox.showwarning if erreur else messagebox.showinfo)("Retirer", texte, parent=parent or app)
+            if suite:
+                suite(None)
+
+        app.tache(f"Retrait de {h.nom}", travail, fin)
+
+
+class FenetreStockage(Dialogue):
+    """Emplacement de stockage : serveur, compte, dossiers des labos et des ISO (test avant enregistrement)."""
+
+    def __init__(self, app):
+        st = app.stockage
+        creation = st is None
+        super().__init__(app, "Emplacement de stockage",
+                         "Le stockage garde les labos exportés et la bibliothèque d'ISO. Debian ou NAS Synology "
+                         "avec SSH et rsync ; le compte doit pouvoir écrire dans les dossiers.", largeur=680)
+        try:
+            s = L.lire_config(app.chemin_config).get("stockage") or {}
+        except Exception:
+            s = {}
+        self.ancien = (s.get("ip"), s.get("utilisateur"))
+        self.creation = creation
+        self.a_mdp = bool(s.get("mot_de_passe"))
+        self.var_ip = tk.StringVar(value=s.get("ip", ""))
+        self.var_util = tk.StringVar(value=s.get("utilisateur", ""))
+        self.var_mdp = tk.StringVar()
+        self.var_chemin = tk.StringVar(value=s.get("chemin", ""))
+        chemin_iso = s.get("chemin_iso") or (s["chemin"].rstrip("/") + "/iso" if s.get("chemin") else "")
+        self.var_iso = tk.StringVar(value=chemin_iso)
+        self.var_iso_suit = tk.BooleanVar(value=not s.get("chemin") or
+                                          chemin_iso == s.get("chemin", "").rstrip("/") + "/iso")
+        self.var_effacer = tk.BooleanVar(value=False)
+
+        e = self.champ("Serveur (IP) :", self.var_ip, "ex. 192.168.100.10")
+        self.champ("Compte SSH :", self.var_util, "propriétaire des dossiers")
+        self.champ("Mot de passe :", self.var_mdp, "vide = inchangé" if self.a_mdp else "pour la préparation",
+                   show="•")
+        self.champ("Dossier des labos :", self.var_chemin, "chemin complet")
+        self.ent_iso = self.champ("Dossier des ISO :", self.var_iso, "")
+        self.case("Ranger les ISO dans le sous-dossier « iso » du dossier des labos", self.var_iso_suit)
+        if self.a_mdp:
+            self.case("Effacer le mot de passe enregistré (les clés SSH suffisent une fois la ferme préparée)",
+                      self.var_effacer)
+        self.var_chemin.trace_add("write", lambda *a: self._suivre())
+        self.var_iso_suit.trace_add("write", lambda *a: self._suivre())
+        self._suivre()
+
+        ttk.Label(self.cadre, text="Les labos déjà présents dans un ancien dossier ne sont pas déplacés.",
+                  style="Doux.TLabel").pack(anchor="w", pady=(10, 0))
+        self.txt = tk.Text(self.cadre, height=7, wrap="word", relief="flat", background=T["surface"],
+                           foreground=T["encre"], font=(app.police, 10), highlightthickness=1,
+                           highlightbackground=T["ligne"], padx=8, pady=6)
+        self.txt.pack(fill="x", pady=(8, 0))
+        self.txt.tag_configure("ok", foreground="#1a7f37")
+        self.txt.tag_configure("ko", foreground=T["danger"])
+        self.txt.tag_configure("doux", foreground=T["doux"])
+        self._ecrire([("doux", "« Tester » vérifie la connexion, rsync et les dossiers sans rien modifier.")])
+
+        self.bouton("Annuler", self.destroy)
+        self.bouton("Enregistrer", self.enregistrer, "Action.TButton")
+        self.bouton("Tester", lambda: self.tester(False), gauche=True)
+        self.centrer()
+        e.focus_set()
+
+    def _suivre(self):
+        if self.var_iso_suit.get():
+            c = self.var_chemin.get().strip().rstrip("/")
+            self.var_iso.set(f"{c}/iso" if c else "")
+            self.ent_iso.configure(state="disabled")
+        else:
+            self.ent_iso.configure(state="normal")
+
+    def _ecrire(self, morceaux):
+        self.txt.configure(state="normal")
+        self.txt.delete("1.0", "end")
+        for tag, texte in morceaux:
+            self.txt.insert("end", texte + "\n", tag)
+        self.txt.configure(state="disabled")
+
+    def _valeurs(self):
+        ip, util = self.var_ip.get().strip(), self.var_util.get().strip()
+        chemin = self.var_chemin.get().strip().rstrip("/")
+        iso = self.var_iso.get().strip().rstrip("/") or (chemin + "/iso")
+        if not ip or not util or not chemin:
+            raise L.Erreur("Indiquez le serveur, le compte et le dossier des labos.")
+        mdp_saisi = self.var_mdp.get()
+        mdp_test = mdp_saisi or (self.app.stockage.mot_de_passe if self.app.stockage and
+                                 (ip, util) == self.ancien else None)
+        return ip, util, chemin, iso, mdp_saisi, mdp_test
+
+    def tester(self, enregistrer):
+        try:
+            ip, util, chemin, iso, mdp_saisi, mdp_test = self._valeurs()
+        except L.Erreur as e:
+            messagebox.showerror("Stockage", str(e), parent=self)
+            return
+        self._ecrire([("doux", f"Test de {util}@{ip}…")])
+        self.app.tache("Test du stockage",
+                       lambda: L.tester_stockage(ip, util, mdp_test, chemin, iso, creer=enregistrer),
+                       lambda res: self.winfo_exists() and self._resultat(res, enregistrer))
+
+    def _resultat(self, res, enregistrer):
+        self._ecrire([("ok" if ok else "ko", f"{'✔' if ok else '✘'}  {etape} : {det}") for etape, ok, det in res])
+        if not enregistrer:
+            return
+        if not all(ok for _, ok, _ in res) and not messagebox.askyesno(
+                "Stockage", "Le test a échoué (voir le détail).\nEnregistrer quand même cet emplacement ?",
+                parent=self):
+            return
+        ip, util, chemin, iso, mdp_saisi, _ = self._valeurs()
+        mdp = mdp_saisi if mdp_saisi else ("" if self.var_effacer.get() else None)
+        try:
+            L.enregistrer_stockage(self.app.chemin_config, ip, util, mdp, chemin, iso)
+        except Exception as e:
+            messagebox.showerror("Stockage", str(e), parent=self)
+            return
+        change = (ip, util) != self.ancien
+        app, creation = self.app, self.creation
+        self.destroy()
+        try:
+            app.charger_config()
+        except Exception as e:
+            messagebox.showerror("Configuration", str(e))
+            return
+        if change and messagebox.askyesno(
+                "Stockage", ("Stockage enregistré.\n\n" if not creation else
+                             f"Configuration créée : {app.chemin_config}\n\n") +
+                "C'est un nouveau serveur de stockage : les clés SSH de ce poste et des PC de la ferme doivent "
+                "y être installées (et la sienne sur les PC).\n\nLancer « Préparer la ferme » maintenant ?"):
+            app.preparer(confirmer=False, suite=app.recharger_tout)
+        else:
+            app.recharger_tout()
+
+    def enregistrer(self):
+        self.tester(True)
+
+
+class FenetreExport(tk.Toplevel):
+    """Export d'un labo (réseaux virtuels + VM) vers le stockage, depuis ce poste, un PC de la ferme ou une
+    machine source (section « sources » de ferme.yaml)."""
+
+    def __init__(self, app, source=None):
         super().__init__(app)
-        self.app, self.reseaux = app, reseaux
-        self.title("Exporter un labo de ce poste")
-        self.geometry("720x560")
+        self.app = app
+        self.title("Exporter un labo vers le stockage")
+        self.geometry("780x660")
+        self.minsize(700, 560)
         self.transient(app)
         self.choisis = set()
+        self.reseaux = []
+        self.machines = {}                  # libellé de la liste -> Hote (None = ce poste)
 
-        f = ttk.Frame(self, padding=10)
+        f = ttk.Frame(self, padding=14)
         f.pack(fill="both", expand=True)
-        ttk.Label(f, text="Cochez le ou les réseaux virtuels qui forment le labo. "
-                          "Toutes les VM qui y sont branchées seront exportées.",
-                  wraplength=680).pack(anchor="w")
+        ttk.Label(f, text="Exporter un labo vers le stockage", font=(app.police, 13, "bold")).pack(anchor="w")
+        ttk.Label(f, text="Choisissez la machine où se trouve le labo, puis cochez le ou les réseaux virtuels qui "
+                          "le forment : toutes les VM qui y sont branchées seront exportées. Les disques partent "
+                          "directement de cette machine vers le stockage.", style="Doux.TLabel",
+                  wraplength=740, justify="left").pack(anchor="w", pady=(2, 10))
 
-        self.arbre = ttk.Treeview(f, columns=("pont", "ip", "etat"), show="tree headings", selectmode="none", height=12)
+        ligne = ttk.Frame(f)
+        ligne.pack(fill="x")
+        ttk.Label(ligne, text="Machine source :").pack(side="left")
+        self.var_source = tk.StringVar()
+        self.cb_source = ttk.Combobox(ligne, textvariable=self.var_source, state="readonly", width=44)
+        self.cb_source.pack(side="left", padx=8)
+        self.cb_source.bind("<<ComboboxSelected>>", lambda e: self.charger())
+        b = ttk.Button(ligne, text="+ Autre machine…", style="Outil.TButton", command=self.nouvelle_source)
+        b.pack(side="left")
+        Infobulle(b, "Ajouter une machine d'où exporter (poste d'un collègue…) : elle est enregistrée comme "
+                     "« source » dans ferme.yaml et n'est jamais une cible de déploiement")
+        self.btn_gerer = ttk.Button(ligne, text="⋯", width=3, style="Outil.TButton")
+        self.btn_gerer.pack(side="left", padx=4)
+        self.menu_gerer = tk.Menu(self, tearoff=0)
+        self.menu_gerer.add_command(label="Modifier cette source…", command=self.modifier_source)
+        self.menu_gerer.add_command(label="Retirer cette source…", command=self.retirer_source)
+        self.btn_gerer.configure(command=lambda w=self.btn_gerer: self.menu_gerer.tk_popup(
+            w.winfo_rootx(), w.winfo_rooty() + w.winfo_height()))
+        Infobulle(self.btn_gerer, "Modifier ou retirer la source choisie")
+        b = ttk.Button(ligne, text="⟳", width=3, style="Outil.TButton", command=self.charger)
+        b.pack(side="right")
+        Infobulle(b, "Relire les réseaux et les VM de la machine choisie")
+
+        etat = ttk.Frame(f)
+        etat.pack(fill="x", pady=(8, 0))
+        self.lbl_etat = ttk.Label(etat, text="", compound="left", wraplength=560, justify="left")
+        self.lbl_etat.pack(side="left", fill="x", expand=True)
+        self.btn_preparer = ttk.Button(etat, text="Préparer cette machine…", command=self.preparer)
+
+        self.arbre = ttk.Treeview(f, columns=("pont", "ip", "etat"), show="tree headings", selectmode="none",
+                                  height=10)
         self.arbre.heading("#0", text="  Réseau / VM")
-        self.arbre.column("#0", width=280)
-        for c, t, w in (("pont", "Pont", 80), ("ip", "Sous-réseau", 140), ("etat", "État", 130)):
+        self.arbre.column("#0", width=300)
+        for c, t, w in (("pont", "Pont", 80), ("ip", "Sous-réseau", 140), ("etat", "État", 140)):
             self.arbre.heading(c, text=t)
             self.arbre.column(c, width=w)
-        self.arbre.pack(fill="both", expand=True, pady=6)
+        self.arbre.pack(fill="both", expand=True, pady=8)
         self.arbre.bind("<Button-1>", self._clic)
         self.arbre.tag_configure("vm", foreground="#555")
+        self.arbre.tag_configure("vide", foreground=T["doux"])
 
         g = ttk.Frame(f)
         g.pack(fill="x")
@@ -2365,12 +2866,114 @@ class FenetreExport(tk.Toplevel):
         b = ttk.Frame(f)
         b.pack(fill="x", pady=(10, 0))
         ttk.Button(b, text="Annuler", command=self.destroy).pack(side="right")
-        ttk.Button(b, text="⬆  Exporter vers le stockage", style="Action.TButton",
-                   command=self.valider).pack(side="right", padx=6)
+        self.btn_exporter = ttk.Button(b, text="⬆  Exporter vers le stockage", style="Action.TButton",
+                                       command=self.valider)
+        self.btn_exporter.pack(side="right", padx=6)
+        self.remplir_sources(source)
+        self.charger()
+
+    # ---------------------------------------------------------------- machines sources
+
+    def remplir_sources(self, choisir=None):
+        """choisir : nom d'une machine à sélectionner (None = garder le choix actuel, sinon ce poste)."""
+        actuel = self.machine().nom if self.machines and self.machine() else None
+        self.machines = {f"Ce poste ({socket.gethostname()})": None}
+        for h in self.app.sources:
+            self.machines[f"{h.nom} – {h.ip}  (source)"] = h
+        for h in self.app.hotes:
+            self.machines[f"{h.nom} – {h.ip}  (PC de la ferme)"] = h
+        self.cb_source.configure(values=list(self.machines))
+        voulu = choisir or actuel
+        libelle = next((l for l, h in self.machines.items() if h is not None and h.nom == voulu),
+                       next(iter(self.machines)))
+        self.var_source.set(libelle)
+
+    def machine(self):
+        return self.machines.get(self.var_source.get())
+
+    def _maj_gerer(self):
+        h = self.machine()
+        etat = "normal" if h is not None and h.source else "disabled"
+        for i in (0, 1):
+            self.menu_gerer.entryconfigure(i, state=etat)
+
+    def nouvelle_source(self):
+        FenetrePC(self.app, "sources", parent=self, suite=self._apres_source)
+
+    def modifier_source(self):
+        h = self.machine()
+        if h is not None and h.source:
+            FenetrePC(self.app, "sources", h, parent=self, suite=self._apres_source)
+
+    def retirer_source(self):
+        h = self.machine()
+        if h is not None and h.source:
+            self.app.retirer_pc(h.nom, "sources", parent=self, suite=self._apres_source)
+
+    def _apres_source(self, nom, lire=True):
+        if self.winfo_exists():
+            self.remplir_sources(nom)
+            if lire:
+                self.charger()
+
+    # ---------------------------------------------------------------- lecture des labos de la machine
+
+    def _etat(self, couleur, texte, preparer=False):
+        self.lbl_etat.configure(text=" " + texte, image=self.app.pastilles[couleur])
+        if preparer:
+            self.btn_preparer.pack(side="right")
+        else:
+            self.btn_preparer.pack_forget()
+
+    def charger(self):
+        self._maj_gerer()
+        h, libelle = self.machine(), self.var_source.get()
+        nom = "ce poste" if h is None else h.nom
+        self.reseaux, self.choisis = [], set()
         self.afficher()
+        self._etat("gris", f"Lecture des réseaux et des VM de {nom}…")
+        self.btn_exporter.state(["disabled"])
+        if self.app.occupe:
+            self._etat("gris", "Une autre opération est en cours : cliquez sur ⟳ quand elle sera terminée.")
+            return
+        c = L.hote_local() if h is None else h.clone()
+
+        def travail():
+            try:
+                pret, raison = L.source_prete(c, self.app.stockage)
+                return pret, raison, (L.labos_locaux(c) if pret else None)
+            finally:
+                c.fermer()
+
+        def fin(res):
+            if not self.winfo_exists() or self.var_source.get() != libelle:
+                return
+            pret, raison, reseaux = res
+            if not pret:
+                self._etat("orange", f"{nom} n'est pas prête pour l'export : {raison}", preparer=True)
+                return
+            self.reseaux = reseaux
+            self._etat("vert", f"{nom} : {len(reseaux)} réseau(x) virtuel(s) – {raison}")
+            self.btn_exporter.state(["!disabled"])
+            self.afficher()
+
+        self.app.tache(f"Lecture des labos de {nom}", travail, fin)
+
+    def preparer(self):
+        h = self.machine()
+        if h is None:
+            self.app.preparer_local(suite=lambda: self.winfo_exists() and self.charger())
+        elif h.source:
+            self.app.preparer_source(h, suite=lambda: self.winfo_exists() and self.charger(), parent=self)
+        else:
+            self.app.preparer(noms=[h.nom], suite=lambda: self.winfo_exists() and self.charger())
+
+    # ---------------------------------------------------------------- choix des réseaux
 
     def afficher(self):
         self.arbre.delete(*self.arbre.get_children())
+        if not self.reseaux:
+            self.arbre.insert("", "end", text="   (aucun réseau virtuel à afficher)", tags=("vide",))
         for r in self.reseaux:
             nb = len(r["vms"])
             iid = "net:" + r["nom"]
@@ -2409,11 +3012,13 @@ class FenetreExport(tk.Toplevel):
             messagebox.showerror("Exporter", f"VM allumées : {', '.join(sorted(set(allumees)))}.\n"
                                              "Éteignez-les ou cochez l'option d'arrêt.", parent=self)
             return
+        h = self.machine()
         args = argparse.Namespace(reseau=sorted(self.choisis), vm=None, nom=nom, hote=None,
+                                  source=None if h is None else h.clone(),
                                   proprietaire=self.var_prop.get().strip() or None,
                                   description=self.var_desc.get().strip(), arreter=self.var_arreter.get(),
                                   laisser_eteint=self.var_eteint.get(), ecraser=False)
-        if self.app.exporter(args):
+        if self.app.exporter(args, parent=self):
             self.destroy()
 
 
