@@ -1462,8 +1462,10 @@ def cmd_sauvegarder(args, stockage, hotes):
     for d in en_marche:
         arreter_vm(src, d)
 
+    termine = False
     try:
-        stockage.run(f"mkdir -p {q(tmp)}/xml {q(tmp)}/disques")
+        # Repart d'un dossier vide : un export précédent interrompu peut avoir laissé des fichiers résiduels.
+        stockage.run(f"rm -rf {q(tmp)} && mkdir -p {q(tmp)}/xml {q(tmp)}/disques")
         ssh_e = f"ssh -i {src.cle} {SSH_OPTS}"
         cible_stock = f"{stockage.utilisateur}@{stockage.ip}"
         manifeste = {"nom": nom, "proprietaire": args.proprietaire or getpass.getuser(),
@@ -1499,8 +1501,15 @@ def cmd_sauvegarder(args, stockage, hotes):
         stockage.ecrire(f"{tmp}/labo.json", json.dumps(manifeste, indent=2, ensure_ascii=False))
         stockage.run(f"rm -rf {q(dest)}.ancien && (test -d {q(dest)} && mv {q(dest)} {q(dest)}.ancien || true) "
                      f"&& mv {q(tmp)} {q(dest)} && rm -rf {q(dest)}.ancien")
+        termine = True
         log(p, f"sauvegarde terminée → {stockage.ip}:{dest}")
     finally:
+        if not termine:                 # échec ou interruption : ne laisse pas d'export à moitié copié
+            try:
+                stockage.run(f"rm -rf {q(tmp)}", verifier=False)
+                log(p, "export interrompu : dossier temporaire supprimé du stockage", "alerte")
+            except Erreur as e:
+                log(p, f"dossier temporaire {tmp} non supprimé ({e})", "alerte")
         if en_marche and not args.laisser_eteint:
             for d in en_marche:
                 src.virsh(f"start {q(d)}", verifier=False)
@@ -1624,13 +1633,16 @@ def cmd_deployer(args, stockage, hotes):
 # --------------------------------------------------------------------------- commande : retirer
 
 def retirer_de(h, man, args):
+    # Le nom sert à construire le chemin d'un « rm -rf » : il doit être sûr avant de toucher à quoi que ce soit.
+    if not NOM_VALIDE.match(man.get("nom") or "") or not h.images.startswith("/"):
+        raise Erreur(f"{h.nom} : retrait refusé, nom de labo ou dossier d'images invalide "
+                     f"(« {man.get('nom')} », « {h.images} »)")
     tous, _ = lire_domaines(h)
     for v in man["vms"]:
         if v["nom"] in tous:
             supprimer_vm(h, v["nom"])
             log(h.nom, f"VM « {v['nom']} » supprimée")
-    if propre(man["nom"]) and h.images.startswith("/"):
-        h.run(h.sudo(f"rm -rf {q(h.images + '/' + man['nom'])}"))
+    h.run(h.sudo(f"rm -rf {q(h.images + '/' + man['nom'])}"))
     if args.garder_reseaux:
         return
     restants, _ = lire_domaines(h)
@@ -1652,6 +1664,7 @@ def retirer_de(h, man, args):
 def cmd_retirer(args, stockage, hotes):
     cibles = choisir_hotes(hotes, args)
     man = lire_manifeste(stockage, args.labo)
+    man["nom"] = args.labo          # le nom du dossier fait foi, pas celui écrit dans labo.json (comme au déploiement)
     if not args.oui:
         rep = input(f"Supprimer le labo « {man['nom']} » (VM et disques) de "
                     f"{', '.join(h.nom for h in cibles)} ? [o/N] ")
