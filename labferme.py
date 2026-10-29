@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-labferme.py — Ferme KVM 1.1.0 — Sauvegarde et déploiement de labos KVM/libvirt sur une ferme de serveurs Debian.
+labferme.py — Ferme KVM 1.2.0 — Sauvegarde et déploiement de labos KVM/libvirt sur une ferme de serveurs Debian.
 
 Un « labo » = un ou plusieurs réseaux virtuels libvirt + toutes les VM qui y sont branchées.
 
@@ -25,6 +25,8 @@ Commandes :
     stockage     Affiche ou modifie l'emplacement de stockage
     pc-ajouter   Ajoute un PC à la ferme (ou une source d'export avec --source)
     pc-retirer   Retire un PC de la ferme (et révoque sa clé sur le stockage)
+    transferer   Déploie un labo d'une machine vers d'autres, sans stockage central (secours)
+    lier         Prépare l'envoi direct d'une machine vers d'autres (clés SSH, droits)
 
 Dépendances du poste maître :  apt install python3-paramiko python3-yaml rsync
 """
@@ -57,8 +59,8 @@ try:
 except ImportError:
     sys.exit("Modules manquants : sudo apt install python3-paramiko python3-yaml")
 
-__version__ = "1.1.0"                      # version de Ferme KVM (moteur + interface)
-DATE_VERSION = "2026-10-21"
+__version__ = "1.2.0"                      # version de Ferme KVM (moteur + interface)
+DATE_VERSION = "2026-10-29"
 
 VIRSH = "virsh -q -c qemu:///system"
 NOM_CLE = "labferme"                       # ~/.ssh/labferme sur chaque machine
@@ -386,7 +388,7 @@ ENTETE_CONFIG = ("# Configuration de la ferme — à protéger : chmod 600 ferme
                  "# mot_de_passe_root (facultatif, par PC ou dans defaut) : pour les comptes non sudoers ;\n"
                  "# s'il est absent, l'interface le demande au moment de la préparation.\n"
                  "# hotes : PC de la ferme (cibles des déploiements) ; sources : machines d'où l'on exporte\n"
-                 "# des labos, jamais utilisées comme cibles.\n"
+                 "# des labos, jamais cibles d'un déploiement depuis le stockage (elles peuvent recevoir un transfert direct).\n"
                  "# Le stockage, les PC, les sources et les pools se modifient aussi depuis l'interface.\n\n")
 
 
@@ -423,18 +425,23 @@ def charger_sources(chemin):
     return [_hote_depuis(h, d, source=True) for h in cfg.get("sources", []) or []]
 
 
-def charger_config(chemin):
+def charger_config(chemin, exiger_stockage=True):
+    """Renvoie (stockage, hotes). exiger_stockage=False : une configuration sans stockage est acceptée
+    (stockage vaut alors None) ; sert au transfert direct de machine à machine."""
     cfg = lire_config(chemin)
     if os.stat(chemin).st_mode & 0o077:
         print(f"Attention : {chemin} contient des mots de passe, faites « chmod 600 {chemin} ».", file=sys.stderr)
+    stockage = None
     if not cfg.get("stockage") or not cfg["stockage"].get("ip"):
-        raise ConfigIncomplete(f"{chemin} : section « stockage » absente ou sans adresse IP "
-                     f"(interface : clic sur le stockage → « Configurer le stockage… »)")
-    s = cfg["stockage"]
-    stockage = Hote("stockage", s["ip"], s.get("utilisateur", "root"), s.get("mot_de_passe"),
-                    mdp_root=s.get("mot_de_passe_root"))
-    stockage.chemin = s.get("chemin", "/srv/labos").rstrip("/")
-    stockage.chemin_iso = (s.get("chemin_iso") or stockage.chemin + "/iso").rstrip("/")
+        if exiger_stockage:
+            raise ConfigIncomplete(f"{chemin} : section « stockage » absente ou sans adresse IP "
+                                   f"(interface : clic sur le stockage → « Configurer le stockage… »)")
+    else:
+        s = cfg["stockage"]
+        stockage = Hote("stockage", s["ip"], s.get("utilisateur", "root"), s.get("mot_de_passe"),
+                        mdp_root=s.get("mot_de_passe_root"))
+        stockage.chemin = s.get("chemin", "/srv/labos").rstrip("/")
+        stockage.chemin_iso = (s.get("chemin_iso") or stockage.chemin + "/iso").rstrip("/")
     d = cfg.get("defaut", {}) or {}
     global ISOS_LOCAL
     ISOS_LOCAL = d.get("isos", ISOS_DEFAUT)
@@ -583,8 +590,8 @@ def tester_stockage(ip, utilisateur, mot_de_passe, dossier, dossier_iso, creer=F
 
 def revoquer_machine(stockage, h, nettoyer=False):
     """Coupe les accès Ferme KVM d'une machine retirée de la ferme.
-    1. Sur le stockage : retire sa clé publique de authorized_keys (par commentaire et, si la machine
-       répond, par contenu exact).
+    1. Sur le stockage (s'il y en a un) : retire sa clé publique de authorized_keys (par commentaire et, si
+       la machine répond, par contenu exact).
     2. nettoyer=True et machine joignable : supprime sur elle la règle sudo labferme, sa clé ~/.ssh/labferme
        et les clés « labferme-… » de authorized_keys (en dernier : l'accès de ce poste est alors coupé).
     Les VM, disques et réseaux de la machine ne sont jamais touchés. Renvoie une liste de messages."""
@@ -598,14 +605,15 @@ def revoquer_machine(stockage, h, nettoyer=False):
         except Erreur as e:
             detail(h.nom, f"machine injoignable pendant la révocation : {e}")
         commentaire = nom_cle(c)
-        script = ("f=~/.ssh/authorized_keys; [ -f \"$f\" ] || exit 0; "
-                  f"awk -v c={q(commentaire)} -v k={q(pub or '')} "
-                  "'$NF != c && (k == \"\" || $0 != k)' \"$f\" > \"$f.labferme\" && "
-                  "n=$(( $(wc -l < \"$f\") - $(wc -l < \"$f.labferme\") )) && "
-                  "cat \"$f.labferme\" > \"$f\" && rm -f \"$f.labferme\" && echo $n")
-        n = stockage.sortie(script).strip() or "0"
-        faits.append(f"stockage : {n} clé(s) « {commentaire} » retirée(s)")
-        log(h.nom, faits[-1], "succes")
+        if stockage is not None:            # sans stockage configuré, il n'y a aucune clé à y révoquer
+            script = ("f=~/.ssh/authorized_keys; [ -f \"$f\" ] || exit 0; "
+                      f"awk -v c={q(commentaire)} -v k={q(pub or '')} "
+                      "'$NF != c && (k == \"\" || $0 != k)' \"$f\" > \"$f.labferme\" && "
+                      "n=$(( $(wc -l < \"$f\") - $(wc -l < \"$f.labferme\") )) && "
+                      "cat \"$f.labferme\" > \"$f\" && rm -f \"$f.labferme\" && echo $n")
+            n = stockage.sortie(script).strip() or "0"
+            faits.append(f"stockage : {n} clé(s) « {commentaire} » retirée(s)")
+            log(h.nom, faits[-1], "succes")
         if nettoyer:
             if not joignable:
                 faits.append(f"{h.nom} injoignable : rien n'a été nettoyé sur la machine")
@@ -1394,15 +1402,22 @@ def sans_backing(xml):
     return ET.tostring(r, encoding="unicode")
 
 
+def aplatir(src, chemin, suffixe=""):
+    """Fusionne un disque et ses images de base en un qcow2 autonome dans /var/tmp de src ; renvoie son chemin.
+    suffixe distingue deux disques de même nom quand plusieurs aplatissements coexistent."""
+    tmp = f"/var/tmp/labferme-{os.getpid()}{suffixe}-{propre(os.path.basename(chemin))}.qcow2"
+    log(src.nom, f"{os.path.basename(chemin)} a une image de base → aplatissement en qcow2")
+    src.run(src.sudo(f"qemu-img convert -U -O qcow2 {q(chemin)} {q(tmp)}"))
+    return tmp
+
+
 def copier_vers(src, chemin, destination, ssh_e):
     """Copie un fichier de src vers destination (user@ip:chemin) ; aplatit les chaînes de snapshots."""
     info = json.loads(src.sortie(src.sudo(f"qemu-img info -U --output=json {q(chemin)}")))
     fmt = info.get("format", "raw")
     a_copier, tmp = chemin, None
     if info.get("backing-filename"):
-        tmp = f"/var/tmp/labferme-{os.getpid()}-{propre(os.path.basename(chemin))}.qcow2"
-        log(src.nom, f"{os.path.basename(chemin)} a une image de base → aplatissement en qcow2")
-        src.run(src.sudo(f"qemu-img convert -U -O qcow2 {q(chemin)} {q(tmp)}"))
+        tmp = aplatir(src, chemin)
         a_copier, fmt = tmp, "qcow2"
     try:
         src.run(src.sudo(f"rsync -a --sparse -e {q(ssh_e)} {q(a_copier)} {q(destination)}"))
@@ -1420,6 +1435,28 @@ def trouver_machine(nom, hotes, sources=()):
     raise Erreur(f"machine « {nom} » absente de la configuration (ni PC de la ferme, ni source d'export)")
 
 
+def lire_labo(src, noms_reseaux, vm_sup=None):
+    """Lit sur la machine src les réseaux demandés et toutes les VM qui y sont branchées (plus vm_sup).
+    Renvoie (reseaux, vms, actifs, autostart) : tous les réseaux de src {nom: infos}, {vm: xml} du labo,
+    VM allumées, VM en démarrage automatique."""
+    reseaux = lire_reseaux(src)
+    for r in noms_reseaux:
+        if r not in reseaux:
+            raise Erreur(f"réseau « {r} » absent de {src.nom}. Réseaux présents : {', '.join(reseaux)}")
+    ponts = {reseaux[r]["bridge"] for r in noms_reseaux if reseaux[r]["bridge"]}
+    tous, actifs = lire_domaines(src)
+    autostart = set(lignes(src.virsh("list --all --autostart --name")[1]))
+    vms = {}
+    for d in tous:
+        xml = src.virsh(f"dumpxml --inactive {q(d)}")[1]
+        nets, brs = branchements(xml)
+        if nets & set(noms_reseaux) or brs & ponts or d in (vm_sup or []):
+            vms[d] = xml
+    if not vms:
+        raise Erreur(f"aucune VM branchée sur {', '.join(noms_reseaux)}")
+    return reseaux, vms, actifs, autostart
+
+
 def cmd_sauvegarder(args, stockage, hotes):
     """Exporte un labo vers le stockage depuis : args.source (Hote déjà construit, ex. machine saisie dans
     l'interface), sinon --hote (PC de la ferme ou source d'export de ferme.yaml), sinon ce poste."""
@@ -1430,21 +1467,7 @@ def cmd_sauvegarder(args, stockage, hotes):
     else:
         src = hote_local()
     p = src.nom
-    reseaux = lire_reseaux(src)
-    for r in args.reseau:
-        if r not in reseaux:
-            raise Erreur(f"réseau « {r} » absent de {p}. Réseaux présents : {', '.join(reseaux)}")
-    ponts = {reseaux[r]["bridge"] for r in args.reseau if reseaux[r]["bridge"]}
-    tous, actifs = lire_domaines(src)
-    autostart = set(lignes(src.virsh("list --all --autostart --name")[1]))
-    vms = {}
-    for d in tous:
-        xml = src.virsh(f"dumpxml --inactive {q(d)}")[1]
-        nets, brs = branchements(xml)
-        if nets & set(args.reseau) or brs & ponts or d in (args.vm or []):
-            vms[d] = xml
-    if not vms:
-        raise Erreur(f"aucune VM branchée sur {', '.join(args.reseau)}")
+    reseaux, vms, actifs, autostart = lire_labo(src, args.reseau, args.vm)
 
     nom = args.nom or args.reseau[0]
     if not NOM_VALIDE.match(nom):
@@ -1508,7 +1531,7 @@ def cmd_sauvegarder(args, stockage, hotes):
             try:
                 stockage.run(f"rm -rf {q(tmp)}", verifier=False)
                 log(p, "export interrompu : dossier temporaire supprimé du stockage", "alerte")
-            except Erreur as e:
+            except Exception as e:      # connexion perdue, etc. : ne pas masquer l'erreur d'origine
                 log(p, f"dossier temporaire {tmp} non supprimé ({e})", "alerte")
         if en_marche and not args.laisser_eteint:
             for d in en_marche:
@@ -1525,9 +1548,16 @@ def envoyer(stockage, source, h, dest):
                  f"{q(f'{h.utilisateur}@{h.ip}:{dest}')}")
 
 
-def deployer_sur(h, stockage, man, xml_res, xml_vm, args, tailles=None):
+def deployer_sur(h, stockage, man, xml_res, xml_vm, args, tailles=None, envoi=None):
+    """Déploie le labo décrit par man sur le PC h.
+    envoi(fichier, h, dest) amène un fichier du labo (chemin du manifeste) jusqu'à dest sur h ; par défaut le
+    stockage l'envoie. Pour un transfert direct (sans stockage), cmd_transferer fournit sa propre fonction.
+    Elle renvoie False si une NVRAM n'a pas pu être copiée (une NVRAM vierge sera alors créée)."""
     p = h.nom
-    base = f"{stockage.chemin}/{man['nom']}"
+    base = f"{stockage.chemin}/{man['nom']}" if stockage is not None else None
+    if envoi is None:
+        def envoi(fichier, cible, dest):
+            envoyer(stockage, f"{base}/{fichier}", cible, dest)
     reseaux = lire_reseaux(h)
     liens, nets_hote = interfaces_hote(h)
     tous, _ = lire_domaines(h)
@@ -1597,12 +1627,14 @@ def deployer_sur(h, stockage, man, xml_res, xml_vm, args, tailles=None):
         for d in v["disques"]:
             dest = f"{dossier}/{os.path.basename(d['fichier'])}"
             log(p, f"{v['nom']} : réception de {os.path.basename(d['fichier'])}…")
-            envoyer(stockage, f"{base}/{d['fichier']}", h, dest)
+            envoi(d["fichier"], h, dest)
             chemins[d["cible"]], formats[d["cible"]] = dest, d.get("format")
         nvram = None
         if v.get("nvram"):
             nvram = f"{dossier}/{os.path.basename(v['nvram'])}"
-            envoyer(stockage, f"{base}/{v['nvram']}", h, nvram)
+            if envoi(v["nvram"], h, nvram) is False:
+                log(p, f"{v['nom']} : NVRAM non copiée → une NVRAM vierge sera créée", "alerte")
+                nvram = None
         definir(h, "dom", adapter_vm(xml_vm[v["nom"]], chemins, formats, nvram, pont_vers_reseau, h, p))
         if v.get("autostart"):
             h.virsh(f"autostart {q(v['nom'])}", verifier=False)
@@ -1628,6 +1660,298 @@ def cmd_deployer(args, stockage, hotes):
                           args.parallele)
     log("maître", f"bilan : {len(ok)} réussi(s){', ' + str(len(ko)) + ' échec(s) : ' + ', '.join(ko) if ko else ''}")
     return ok, ko
+
+
+# --------------------------------------------------------------------------- commande : transferer
+#
+# Déploiement de secours, sans stockage central : le labo est lu sur la machine source et ses disques partent
+# directement de cette machine vers chaque destination (rsync lancé par la source ; si la destination est ce
+# poste, c'est ce poste qui va chercher les fichiers). Rien n'est écrit sur un serveur de stockage.
+# La source et les destinations peuvent être ce poste, un PC de la ferme ou une machine « source ».
+
+def nom_affiche(h):
+    return "ce poste" if h.local else h.nom
+
+
+def meme_machine(a, b):
+    if a.local or b.local:
+        return a.local and b.local
+    return a.nom == b.nom or a.ip == b.ip
+
+
+def trouver_machine_transfert(nom, hotes, sources=()):
+    """Départ ou arrivée d'un transfert : « local » (ce poste), un PC de la ferme ou une source d'export."""
+    return hote_local() if nom == "local" else trouver_machine(nom, hotes, sources)
+
+
+def choisir_cibles_transfert(args, src, hotes, sources=()):
+    """Destinations : args.cibles (Hote déjà construits), --vers NOM (PC, source ou « local »), --pool, --tous.
+    La source est écartée quand elle vient de --tous ou --pool, mais refusée si on la nomme."""
+    explicites = list(getattr(args, "cibles", None) or [])
+    explicites += [trouver_machine_transfert(n, hotes, sources) for n in (getattr(args, "vers", None) or [])]
+    for c in explicites:
+        if meme_machine(c, src):
+            raise Erreur(f"{nom_affiche(c)} est à la fois la source et la destination du transfert")
+    pools = set(getattr(args, "pool", None) or [])
+    groupe = [h for h in hotes if (getattr(args, "tous", False) or pools & set(h.pools))
+              and not meme_machine(h, src)]
+    choix = []
+    for c in explicites + groupe:
+        if not any(meme_machine(c, x) for x in choix):
+            choix.append(c)
+    if not choix:
+        raise Erreur("aucune machine de destination : utilisez --vers NOM (répétable), --pool NOM ou --tous")
+    return choix
+
+
+def transferer_fichier(src, chemin, cible, dest):
+    """Copie le fichier `chemin` de src vers `dest` sur cible, d'une machine à l'autre. rsync est lancé par la
+    source (envoi) ou, si la destination est ce poste, par ce poste (récupération). Les droits root des deux
+    côtés passent par la règle sudo de Ferme KVM ; les fichiers creux restent creux."""
+    if src.local and cible.local:
+        raise Erreur("la source et la destination sont toutes deux ce poste")
+    options = "-a --sparse --no-owner --no-group"
+    if cible.local:
+        ssh_e = f"ssh -i {cible.cle} {SSH_OPTS}"
+        rsync_distant = "sudo -n rsync" if src.mode == "sudo" else "rsync"
+        origine = f"{src.utilisateur}@{src.ip}:{chemin}"
+        cible.run(cible.sudo(f"rsync {options} -e {q(ssh_e)} --rsync-path={q(rsync_distant)} "
+                             f"{q(origine)} {q(dest)}"))
+    else:
+        ssh_e = f"ssh -i {src.cle} {SSH_OPTS}"
+        rsync_distant = "sudo -n rsync" if cible.mode == "sudo" else "rsync"
+        arrivee = f"{cible.utilisateur}@{cible.ip}:{dest}"
+        src.run(src.sudo(f"rsync {options} -e {q(ssh_e)} --rsync-path={q(rsync_distant)} "
+                         f"{q(chemin)} {q(arrivee)}"))
+
+
+def tester_liaison(src, cible):
+    """Teste, depuis la machine qui lancera rsync, la connexion SSH par clé vers l'autre machine puis rsync
+    (via sudo si besoin) : le chemin exact que prendront les disques. Renvoie [(étape, ok, détail)]."""
+    if src.local and cible.local:
+        return [("machines distinctes", False, "la source et la destination sont toutes deux ce poste")]
+    lanceur, distant = (cible, src) if cible.local else (src, cible)
+    res = []
+    cle_ok = lanceur.run(f"test -f {q(lanceur.cle)}", verifier=False)[0] == 0
+    res.append((f"clé SSH présente sur {nom_affiche(lanceur)}", cle_ok,
+                lanceur.cle if cle_ok else "absente : lancez « Préparer »"))
+    if not cle_ok:
+        return res
+    ssh_e = f"ssh -i {lanceur.cle} {SSH_OPTS} -o PasswordAuthentication=no"
+    spec = f"{distant.utilisateur}@{distant.ip}"
+    trajet = f"{nom_affiche(lanceur)} → {nom_affiche(distant)}"
+    rc, out, err = lanceur.run(f"{ssh_e} {spec} echo labferme-ok", verifier=False)
+    ok = rc == 0 and "labferme-ok" in out
+    res.append((f"connexion SSH par clé {trajet}", ok,
+                "OK" if ok else f"{(err or out).strip()[-300:]}\n→ {conseil_erreur('ssh', err or out)}"))
+    if not ok:
+        return res
+    rsync_distant = "sudo -n rsync" if distant.mode == "sudo" else "rsync"
+    prefixe = "sudo -n " if lanceur.mode == "sudo" else ""
+    rc, out, err = lanceur.run(f"{prefixe}rsync --list-only -e {q(ssh_e)} --rsync-path={q(rsync_distant)} "
+                               f"{q(spec + ':/etc/hostname')}", verifier=False)
+    res.append((f"rsync {trajet}", rc == 0,
+                "OK" if rc == 0 else f"{(err or out).strip()[-300:]}\n→ {conseil_erreur('rsync', err or out)}"))
+    return res
+
+
+def liaison_prete(src, cible):
+    """src peut-elle envoyer un labo à cible ? Renvoie (prête, raison)."""
+    try:
+        for m, role in ((src, "lire les disques des VM"), (cible, "écrire les disques des VM")):
+            if m.mode not in ("root", "sudo"):
+                return False, (f"{nom_affiche(m)} : le compte « {m.utilisateur} » accède à libvirt par le groupe "
+                               f"libvirt seulement, il ne peut pas {role} (« Préparer » installe la règle sudo)")
+        for m, outils in ((src, "rsync && command -v qemu-img"), (cible, "rsync")):
+            if m.run(f"command -v {outils}", verifier=False)[0] != 0:
+                return False, f"{nom_affiche(m)} : rsync ou qemu-img absent"
+        rate = [f"{e} : {d}" for e, ok, d in tester_liaison(src, cible) if not ok]
+        if rate:
+            return False, "; ".join(rate)
+        return True, f"{nom_affiche(src)} → {nom_affiche(cible)} prête (droits via {LIBELLES_MODE[src.mode]})"
+    except Erreur as e:
+        return False, str(e)
+
+
+def preparer_liaison(src, cibles, demander_root=None):
+    """Prépare l'envoi direct de src vers chaque cible : ce poste pilote toutes les machines (sa clé y est
+    autorisée), la clé de src est autorisée sur chaque cible, et chaque machine reçoit rsync, qemu-utils, la
+    règle sudo et les groupes libvirt/kvm. Aucun stockage n'est touché. Renvoie un texte de bilan."""
+    local = hote_local()
+    pub_poste = creer_cle(local)
+    machines = [src] + [c for c in cibles if not meme_machine(c, src)]
+    for h in machines:
+        log(nom_affiche(h), "préparation pour le transfert direct…")
+        if not h.local:
+            autoriser_cles(h, [pub_poste])
+        pret = droits_ok(h) and h.mode in ("root", "sudo") and \
+            h.run("command -v rsync && command -v qemu-img", verifier=False)[0] == 0
+        if not pret:
+            executer_en_root(h, script_preparation(h, False), demander_root)
+        h._mode = None
+        h.fermer()                              # nouvelle session : prise en compte des groupes
+    pub_src = creer_cle(src)
+    for c in cibles:
+        if not c.local:
+            autoriser_cles(c, [pub_src])
+            log(nom_affiche(c), f"clé de {nom_affiche(src)} autorisée")
+    bilan = []
+    for c in cibles:
+        ok, raison = liaison_prete(src, c)
+        log(nom_affiche(c), f"{'OK' if ok else 'incomplet'} – {raison}", "succes" if ok else "alerte")
+        bilan.append((c, ok, raison))
+    rates = [f"{nom_affiche(c)} : {r}" for c, ok, r in bilan if not ok]
+    if rates:
+        raise Erreur("préparation incomplète – " + " ; ".join(rates))
+    return f"{nom_affiche(src)} peut envoyer vers " + ", ".join(nom_affiche(c) for c in cibles)
+
+
+def analyser_disque(src, chemin):
+    """Renvoie (format, a_une_image_de_base, octets) pour un disque de src. Les octets sont ceux réellement
+    occupés par le disque et ses images de base : la place nécessaire une fois le disque aplati."""
+    infos = json.loads(src.sortie(src.sudo(f"qemu-img info -U --backing-chain --output=json {q(chemin)}")))
+    if isinstance(infos, dict):
+        infos = [infos]
+    return (infos[0].get("format", "raw"), bool(infos[0].get("backing-filename")),
+            sum(int(i.get("actual-size") or 0) for i in infos))
+
+
+def manifeste_direct(src, nom, noms_reseaux, reseaux, vms, autostart):
+    """Décrit en mémoire un labo lu sur src, comme labo.json et ses XML mais sans rien copier.
+    Renvoie (manifeste, xml_reseaux, xml_vms, origines) ; origines = {fichier du manifeste: chemin sur src}."""
+    man = {"nom": nom, "source": src.nom, "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+           "reseaux": [], "vms": []}
+    xml_res, xml_vm, origines = {}, {}, {}
+    for r in noms_reseaux:
+        xml_res[r] = nettoyer_reseau(reseaux[r]["xml"])
+        man["reseaux"].append({"nom": r, "fichier": f"xml/reseau-{propre(r)}.xml",
+                               "pont_origine": reseaux[r]["bridge"]})
+    for d, xml in vms.items():
+        v = {"nom": d, "fichier": f"xml/vm-{propre(d)}.xml", "autostart": d in autostart,
+             "disques": [], "nvram": None}
+        for dk in disques(src, xml):
+            if dk["device"] != "disk":
+                continue
+            if not dk["source"]:
+                log(src.nom, f"{d} : disque {dk['cible']} sans fichier (type {dk['type']}) → ignoré")
+                continue
+            fichier = f"disques/{propre(d)}-{dk['cible']}{os.path.splitext(dk['source'])[1] or '.img'}"
+            v["disques"].append({"cible": dk["cible"], "fichier": fichier, "format": None,
+                                 "origine": dk["source"]})
+            origines[fichier] = dk["source"]
+        nv = ET.fromstring(xml).find("os/nvram")
+        if nv is not None and nv.text:
+            v["nvram"] = f"disques/{propre(d)}_VARS.fd"
+            origines[v["nvram"]] = nv.text.strip()
+        xml_vm[d] = sans_backing(xml)
+        man["vms"].append(v)
+    return man, xml_res, xml_vm, origines
+
+
+def cmd_transferer(args, stockage, hotes):
+    """Déploie un labo d'une machine vers une ou plusieurs autres, sans passer par le stockage.
+    Source : args.source (Hote déjà construit), sinon --depuis, sinon ce poste. Destinations : voir
+    choisir_cibles_transfert. Les VM allumées de la source sont éteintes pendant la copie (--arreter)."""
+    sources = getattr(args, "sources", ())
+    if getattr(args, "source", None) is not None:
+        src = args.source
+    elif getattr(args, "depuis", None):
+        src = trouver_machine_transfert(args.depuis, hotes, sources)
+    else:
+        src = hote_local()
+    cibles = choisir_cibles_transfert(args, src, hotes, sources)
+    nom = args.nom or args.reseau[0]
+    if not NOM_VALIDE.match(nom):
+        raise Erreur(f"nom de labo invalide : {nom} (lettres, chiffres, . _ -)")
+
+    reseaux, vms, actifs, autostart = lire_labo(src, args.reseau, args.vm)
+    en_marche = [d for d in vms if d in actifs]
+    if en_marche and not args.arreter and not args.simulation:
+        raise Erreur(f"VM allumées : {', '.join(en_marche)}. Éteignez-les ou ajoutez --arreter.")
+
+    manque = []
+    for c in cibles:
+        ok, raison = liaison_prete(src, c)
+        if not ok:
+            manque.append(f"• {nom_affiche(c)} : {raison}")
+    if manque:
+        raise Erreur("transfert impossible, liaison non prête :\n" + "\n".join(manque) +
+                     "\n\n→ La commande « lier » (« Préparer » dans la fenêtre de transfert) installe les clés "
+                     "SSH et les droits nécessaires.")
+
+    man, xml_res, xml_vm, origines = manifeste_direct(src, nom, args.reseau, reseaux, vms, autostart)
+    tailles, a_aplatir = {}, []
+    for v in man["vms"]:
+        for d in v["disques"]:
+            fmt, base, octets = analyser_disque(src, d["origine"])
+            d["format"] = "qcow2" if base else fmt
+            tailles[d["fichier"]] = octets
+            if base:
+                a_aplatir.append(d)
+    if a_aplatir:
+        besoin_tmp = sum(tailles[d["fichier"]] for d in a_aplatir)
+        libre = espace_libre(src, "/var/tmp")
+        if libre is not None and libre < besoin_tmp + MARGE_DISQUE:
+            raise Erreur(f"{nom_affiche(src)} : place insuffisante dans /var/tmp pour aplatir "
+                         f"{len(a_aplatir)} disque(s) qui ont une image de base : il faut "
+                         f"{taille_lisible(besoin_tmp)} (+ {taille_lisible(MARGE_DISQUE)} de marge), "
+                         f"il reste {taille_lisible(libre)} libres")
+
+    log("maître", f"transfert de « {nom} » ({len(vms)} VM) de {nom_affiche(src)} vers "
+                  f"{', '.join(nom_affiche(c) for c in cibles)} (sans stockage central)")
+    log("maître", f"place nécessaire par machine : {taille_lisible(besoin_vms(man['vms'], tailles))} "
+                  f"(+ {taille_lisible(MARGE_DISQUE)} de marge)")
+
+    copies = dict(origines)                     # fichier du manifeste -> chemin à copier sur la source
+    facultatifs = {v["nvram"] for v in man["vms"] if v.get("nvram")}
+    temporaires, arretees = [], []
+
+    def envoi(fichier, cible, dest):
+        try:
+            transferer_fichier(src, copies[fichier], cible, dest)
+        except Erreur as e:
+            if fichier not in facultatifs:
+                raise
+            detail(cible.nom, f"NVRAM non copiée : {e}")
+            return False
+
+    resultat = ([], [])
+    try:
+        if not args.simulation:
+            for d in en_marche:
+                arreter_vm(src, d)
+                arretees.append(d)
+            for i, d in enumerate(a_aplatir):
+                tmp = aplatir(src, d["origine"], f"-{i}")
+                temporaires.append(tmp)
+                copies[d["fichier"]] = tmp
+        resultat = en_parallele(
+            cibles, lambda h: deployer_sur(h, None, man, xml_res, xml_vm, args, tailles, envoi), args.parallele)
+        ok, ko = resultat
+        log("maître", f"bilan : {len(ok)} réussi(s)" + (f", {len(ko)} échec(s) : {', '.join(ko)}" if ko else ""))
+    finally:
+        for tmp in temporaires:
+            try:
+                src.run(src.sudo(f"rm -f {q(tmp)}"), verifier=False)
+            except Exception as e:
+                log(nom_affiche(src), f"fichier temporaire {tmp} non supprimé ({e})", "alerte")
+        if arretees and not args.laisser_eteint:
+            for d in arretees:
+                src.virsh(f"start {q(d)}", verifier=False)
+            log(nom_affiche(src), "VM redémarrées")
+    return resultat
+
+
+def cmd_lier(args, stockage, hotes):
+    """Prépare l'envoi direct d'une machine vers d'autres (clés SSH, droits). À faire une fois par liaison."""
+    sources = getattr(args, "sources", ())
+    src = trouver_machine_transfert(args.depuis, hotes, sources) if args.depuis else hote_local()
+    cibles = choisir_cibles_transfert(args, src, hotes, sources)
+    try:
+        log("maître", preparer_liaison(src, cibles, getattr(args, "demander_root", None)), "succes")
+    finally:
+        for h in [src] + cibles:
+            h.fermer()
 
 
 # --------------------------------------------------------------------------- commande : retirer
@@ -1944,6 +2268,17 @@ def ajouter_selection(sp):
     sp.add_argument("--parallele", type=int, default=4, metavar="N", help="serveurs traités en même temps (4)")
 
 
+def ajouter_liaison(sp):
+    """Options communes à « transferer » et « lier » : machine de départ et destinations."""
+    sp.add_argument("--depuis", metavar="MACHINE",
+                    help="machine de départ : PC de la ferme, source d'export ou « local » (défaut : ce poste)")
+    g = sp.add_argument_group("destinations")
+    g.add_argument("--vers", action="append", metavar="MACHINE",
+                   help="PC de la ferme, source d'export ou « local » (répétable)")
+    g.add_argument("--tous", action="store_true", help="tous les PC de la ferme (sauf la machine de départ)")
+    g.add_argument("--pool", action="append", metavar="NOM", help="PC d'un pool (répétable)")
+
+
 def construire_parser():
     p = argparse.ArgumentParser(description="Sauvegarde et déploiement de labos KVM sur une ferme Debian.")
     p.add_argument("--version", action="version", version=f"Ferme KVM {__version__} ({DATE_VERSION})")
@@ -1982,6 +2317,27 @@ def construire_parser():
                    help="si le sous-réseau est déjà utilisé sur la cible (défaut : arreter)")
     s.add_argument("--demarrer", action="store_true", help="démarrer les VM après déploiement")
     s.add_argument("--simulation", action="store_true", help="afficher ce qui serait fait, sans rien modifier")
+
+    s = sub.add_parser("transferer", help="déployer un labo d'une machine vers d'autres, sans stockage (secours)")
+    s.add_argument("-r", "--reseau", action="append", required=True,
+                   help="réseau virtuel du labo (répétable si le labo a plusieurs réseaux)")
+    s.add_argument("--vm", action="append", help="VM supplémentaire à inclure (répétable)")
+    s.add_argument("-n", "--nom", help="nom du labo sur les destinations (défaut : nom du 1er réseau)")
+    ajouter_liaison(s)
+    s.add_argument("--parallele", type=int, default=2, metavar="N",
+                   help="destinations servies en même temps (2) : elles se partagent le réseau de la source")
+    s.add_argument("--arreter", action="store_true", help="éteindre proprement les VM allumées de la source "
+                                                          "pendant la copie, puis les relancer")
+    s.add_argument("--laisser-eteint", action="store_true", help="avec --arreter : ne pas relancer les VM")
+    s.add_argument("--remplacer", action="store_true", help="écraser les VM du même nom déjà présentes")
+    s.add_argument("--remplacer-reseaux", action="store_true", help="redéfinir les réseaux du même nom")
+    s.add_argument("--conflit-ip", choices=["arreter", "decaler", "sans-ip"], default="arreter",
+                   help="si le sous-réseau est déjà utilisé sur la destination (défaut : arreter)")
+    s.add_argument("--demarrer", action="store_true", help="démarrer les VM après le transfert")
+    s.add_argument("--simulation", action="store_true", help="afficher ce qui serait fait, sans rien modifier")
+
+    s = sub.add_parser("lier", help="préparer l'envoi direct d'une machine vers d'autres (clés SSH, droits)")
+    ajouter_liaison(s)
 
     s = sub.add_parser("retirer", help="supprimer un labo des serveurs")
     s.add_argument("labo")
@@ -2050,7 +2406,9 @@ def cmd_pc_ajouter(args, stockage, hotes):
     if args.mot_de_passe:
         machine["mot_de_passe"] = getpass.getpass(f"Mot de passe de {args.utilisateur or 'ce compte'}@{args.ip} : ")
     enregistrer_machine(args.config, machine, "sources" if args.source else "hotes")
-    log(args.nom, f"lancez « preparer --hote {args.nom} » pour installer les clés et les droits", "info")
+    suite = (f"preparer --hote {args.nom}" if stockage is not None else
+             f"lier --depuis MACHINE_DE_DEPART --vers {args.nom}")
+    log(args.nom, f"lancez « {suite} » pour installer les clés et les droits", "info")
 
 
 def cmd_pc_retirer(args, stockage, hotes):
@@ -2064,13 +2422,15 @@ COMMANDES = {"preparer": cmd_preparer, "lister": cmd_lister, "inventaire": cmd_i
              "sauvegarder": cmd_sauvegarder, "deployer": cmd_deployer, "retirer": cmd_retirer,
              "isos": cmd_isos, "iso-envoyer": cmd_iso_envoyer, "iso-copier": cmd_iso_copier,
              "iso-supprimer": cmd_iso_supprimer, "stockage": cmd_stockage, "pc-ajouter": cmd_pc_ajouter,
-             "pc-retirer": cmd_pc_retirer}
+             "pc-retirer": cmd_pc_retirer, "transferer": cmd_transferer, "lier": cmd_lier}
+SANS_STOCKAGE = ("transferer", "lier", "pc-ajouter")      # commandes utilisables sans serveur de stockage
 
 
 def main():
     args = construire_parser().parse_args()
     init_journal()
     detail("cli", f"Ferme KVM {__version__} – " + " ".join(sys.argv))
+    stockage = None
     try:
         if args.commande == "stockage" and not os.path.exists(args.config):
             if not (args.ip and args.utilisateur and args.chemin):
@@ -2078,8 +2438,10 @@ def main():
             stockage = Hote("stockage", args.ip, args.utilisateur)
             stockage.chemin, stockage.chemin_iso = args.chemin.rstrip("/"), args.chemin_iso
             hotes = []
+        elif args.commande == "pc-ajouter" and not os.path.exists(args.config):
+            hotes = []                          # le fichier est créé par l'ajout de la machine
         else:
-            stockage, hotes = charger_config(args.config)
+            stockage, hotes = charger_config(args.config, exiger_stockage=args.commande not in SANS_STOCKAGE)
         args.sources = charger_sources(args.config) if os.path.exists(args.config) else []
         res = COMMANDES[args.commande](args, stockage, hotes)
         if isinstance(res, tuple) and res[1]:
@@ -2094,10 +2456,8 @@ def main():
     except KeyboardInterrupt:
         sys.exit(130)
     finally:
-        try:
+        if stockage is not None:
             stockage.fermer()
-        except NameError:
-            pass
 
 
 if __name__ == "__main__":
