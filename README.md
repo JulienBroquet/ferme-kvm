@@ -177,7 +177,7 @@ python3 labferme.py transferer -r reseau-labo --depuis KVM-01 --vers local     #
 
 À savoir :
 
-- Les VM allumées de la machine de départ sont éteintes proprement pendant la copie (option cochée par défaut), puis relancées, même si la copie échoue.
+- Les VM allumées de la machine de départ sont éteintes proprement pendant la copie, puis relancées, même si la copie échoue. Dans l'interface, l'option est cochée par défaut ; en ligne de commande, elle doit être demandée avec `--arreter` (`--laisser-eteint` : ne pas les relancer ensuite).
 - Les disques sont envoyés **de la machine de départ vers chaque destination** (ou, si la destination est ce poste, récupérés par ce poste) : ils ne passent pas par ce poste dans les autres cas. Plusieurs destinations se partagent le réseau de la machine de départ ; 2 sont servies en même temps (`--parallele N`).
 - Un disque issu d'un instantané est fusionné **une seule fois** en un fichier complet, même avec plusieurs destinations : il faut assez de place dans `/var/tmp` de la machine de départ (vérifié avant de toucher aux VM). La place libre de chaque destination est vérifiée comme pour un déploiement.
 - Avant d'éteindre quoi que ce soit, le programme vérifie les droits, la clé SSH et rsync de chaque liaison ; si l'une est incomplète, rien n'est modifié.
@@ -282,7 +282,7 @@ Tout ce que fait l'interface existe aussi en commande : `python3 labferme.py [-c
 | `inventaire` | Réseaux et VM présents sur les PC |
 | `sauvegarder -r RESEAU [-n NOM] [--arreter]` | Exporter un labo de ce poste (ou `--hote PC_OU_SOURCE`) |
 | `deployer LABO --pool salle-a [--conflit-ip decaler] [--simulation]` | Déployer un labo |
-| `transferer -r RESEAU --depuis MACHINE --vers MACHINE [--tous] [--pool P] [--arreter] [--simulation]` | Déployer un labo d'une machine vers d'autres, sans stockage (`local` = ce poste) |
+| `transferer -r RESEAU --depuis MACHINE --vers MACHINE [--tous] [--pool P] [--vm VM] [-n NOM] [--arreter] [--laisser-eteint] [--remplacer] [--remplacer-reseaux] [--conflit-ip …] [--demarrer] [--parallele N] [--simulation]` | Déployer un labo d'une machine vers d'autres, sans stockage (`local` = ce poste) |
 | `lier --depuis MACHINE --vers MACHINE [--tous] [--pool P]` | Préparer l'envoi direct : clés SSH et droits |
 | `retirer LABO --hote srv01` | Retirer un labo |
 | `isos` | Lister les ISO du stockage |
