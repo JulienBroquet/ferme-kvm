@@ -4,6 +4,7 @@
 #   - soit l'interface le demande au moment de la préparation (recommandé, rien n'est enregistré),
 #   - soit indiquez mot_de_passe_root (dans defaut ou pour un PC précis).
 
+# La section « stockage » est facultative si vous n'utilisez que le transfert direct de machine à machine.
 stockage:
   ip: 192.168.100.10
   utilisateur: stockage
@@ -36,7 +37,7 @@ hotes:
     # mot_de_passe_root: "RootSrv04"
 
 # Machines d'où l'on exporte des labos (poste d'un collègue, PC de préparation…) : jamais des cibles de
-# déploiement. Facultatif ; se gère aussi depuis l'interface (fenêtre d'export → « + Autre machine… »).
+# déploiement depuis le stockage (mais elles peuvent envoyer ou recevoir un transfert direct). Facultatif ; se gère aussi depuis l'interface (fenêtre d'export → « + Autre machine… »).
 sources:
   - nom: poste-collegue
     ip: 192.168.100.50

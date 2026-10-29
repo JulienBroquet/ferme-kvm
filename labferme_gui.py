@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-labferme_gui.py — Ferme KVM 1.1.0 — Interface graphique de labferme.py (même dossier).
+labferme_gui.py — Ferme KVM 1.2.0 — Interface graphique de labferme.py (même dossier).
 
     sudo apt install python3-tk python3-paramiko python3-yaml rsync
     python3 labferme_gui.py [-c ferme.yaml]
@@ -12,6 +12,7 @@ labferme_gui.py — Ferme KVM 1.1.0 — Interface graphique de labferme.py (mêm
 - Stockage : emplacement (serveur, compte, dossiers) configurable et testable depuis l'interface.
 - Déployer / retirer le labo choisi sur les PC cochés.
 - Exporter un labo vers le stockage depuis ce poste, un PC de la ferme ou une autre machine (source).
+- Transférer un labo directement d'une machine à d'autres, sans stockage central (solution de secours).
 - Voyants : état des PC testé au démarrage puis automatiquement (vert / orange / rouge).
 - ISO : bibliothèque d'images ISO sur le stockage, copie vers les PC cochés ou ce poste.
 - Journal : fichier ~/.local/state/labferme/labferme.log, consultable via « Journal complet ».
@@ -353,6 +354,8 @@ class Application(tk.Tk):
                 ("labos", "Labos", lambda: self.aller("labos"), "Labos du stockage : déployer, retirer, exporter (Ctrl+1)"),
                 ("isos", "Images ISO", lambda: self.aller("isos"), "Bibliothèque d'ISO du stockage (Ctrl+2)"),
                 (None, None, None, None),
+                ("transfert", "Transférer un labo", self.ouvrir_transfert,
+                 "Déployer un labo d'une machine vers d'autres, sans stockage central (solution de secours)"),
                 ("ferme", "Vue de la ferme", self.ouvrir_vue_ferme, "Tableau : quels labos sur quels PC"),
                 ("machine", "Vue machine", lambda: self.ouvrir_vue_machine(None),
                  "VM, réseaux, instantanés et charge d'un PC"),
@@ -883,34 +886,53 @@ class Application(tk.Tk):
         if self.stockage:
             self.stockage.fermer()
         self.stockage = None
-        self.stockage, self.hotes = L.charger_config(self.chemin_config)
+        # Un fichier sans stockage est accepté : les PC restent gérables et le transfert direct de machine à
+        # machine fonctionne (ConfigAbsente, elle, est toujours levée si le fichier n'existe pas).
+        self.stockage, self.hotes = L.charger_config(self.chemin_config, exiger_stockage=False)
         self.sources = L.charger_sources(self.chemin_config)
         noms = {h.nom for h in self.hotes}
         self.coches &= noms
         self.etats = {n: e for n, e in self.etats.items() if n in noms or n == LOCAL}
-        court = "/".join(self.stockage.chemin.rstrip("/").split("/")[-2:])
-        self.lbl_stockage.configure(text=f" {self.stockage.ip}\n …/{court}")
         self.lbl_config.configure(text=os.path.basename(self.chemin_config))
-        self.lbl_dossier_iso.configure(text=f"Dossier : {self.stockage.chemin_iso}")
+        if self.stockage:
+            court = "/".join(self.stockage.chemin.rstrip("/").split("/")[-2:])
+            self.lbl_stockage.configure(text=f" {self.stockage.ip}\n …/{court}")
+            self.lbl_dossier_iso.configure(text=f"Dossier : {self.stockage.chemin_iso}")
+        else:
+            self._texte_sans_stockage()
         self.afficher_serveurs()
+
+    def _texte_sans_stockage(self):
+        self.lbl_stockage.configure(text=" non configuré\n cliquer pour configurer", image=self.pastilles["gris"])
+        self.lbl_dossier_iso.configure(text="Dossier : aucun stockage configuré")
 
     def recharger_tout(self):
         try:
             self.charger_config()
-        except L.ConfigIncomplete as e:
+        except L.ConfigAbsente as e:
             self._sans_stockage()
             L.log("config", str(e), "alerte")
-            absent = isinstance(e, L.ConfigAbsente)
             if messagebox.askyesno("Configuration",
-                                   (f"Le fichier {self.chemin_config} n'existe pas encore." if absent else str(e))
-                                   + "\n\nConfigurer maintenant l'emplacement de stockage des labos ?"
-                                   + ("\nLe fichier sera créé (chmod 600)." if absent else "")):
+                                   f"Le fichier {self.chemin_config} n'existe pas encore."
+                                   "\n\nConfigurer maintenant l'emplacement de stockage des labos ?"
+                                   "\nLe fichier sera créé (chmod 600)."):
                 FenetreStockage(self)
             return
         except Exception as e:
             self._sans_stockage()
             L.log("ERREUR", f"configuration : {e}")
             messagebox.showerror("Configuration", str(e))
+            return
+        if not self.stockage:
+            # Pas de stockage central (voulu ou pas encore configuré) : on ne harcèle pas l'utilisateur, le
+            # transfert direct entre machines reste disponible et les PC sont surveillés.
+            L.log("config", "aucun stockage configuré : seul le transfert direct de machine à machine est "
+                            "disponible (clic sur « Stockage » pour en configurer un)", "alerte")
+            self.labos = {}
+            self.afficher_labos([])
+            self.lbl_nb_labos.configure(text="aucun stockage configuré")
+            self.surveiller()
+            self.programmer_surveillance()
             return
         self.surveiller()
         self.rafraichir_labos()
@@ -927,7 +949,8 @@ class Application(tk.Tk):
         if labos is not None:
             self._labos_tous = labos
             self.labos = {m["nom"]: m for m in labos}
-            L.log("stockage", f"{len(labos)} labo(s) disponible(s)")
+            if self.stockage:
+                L.log("stockage", f"{len(labos)} labo(s) disponible(s)")
         ancien = self.arbre_labos.selection()
         self.arbre_labos.delete(*self.arbre_labos.get_children())
         filtre = self.filtre(self.var_filtre_labo, self.ent_filtre_labo)
@@ -1270,7 +1293,7 @@ class Application(tk.Tk):
 
     def surveiller(self, manuel=False, noms=None):
         """Teste les PC (et le stockage) en arrière-plan, sans bloquer les autres opérations."""
-        if self._sonde_en_cours or not self.stockage:
+        if self._sonde_en_cours or not (self.stockage or self.hotes):
             return
         self._sonde_en_cours = True
         hotes = [h for h in self.hotes if noms is None or h.nom in noms]
@@ -1561,6 +1584,83 @@ class Application(tk.Tk):
                               self.rafraichir_labos()))
         return True
 
+    def ouvrir_transfert(self, source=None):
+        FenetreTransfert(self, source)
+
+    def transferer(self, args, parent=None):
+        """Lance un transfert direct préparé par FenetreTransfert. Renvoie False si l'utilisateur annule."""
+        src = args.source
+        quoi = "ce poste" if src.local else src.nom
+        noms = ", ".join(L.nom_affiche(c) for c in args.cibles)
+        if not args.simulation and not messagebox.askyesno(
+                "Transférer", f"Transférer le labo « {args.nom} » de {quoi} vers :\n{noms}\n\n"
+                              f"Les disques partent directement de {quoi} vers chaque destination, sans passer "
+                              f"par un stockage. Les VM déjà présentes sont "
+                              f"{'remplacées' if args.remplacer else 'conservées'}.", parent=parent):
+            return False
+
+        def travail():
+            try:
+                return L.cmd_transferer(args, None, self.hotes)
+            finally:
+                for h in [src] + list(args.cibles):
+                    h.fermer()
+
+        def fin(res):
+            ok, ko = res
+            if ko:
+                messagebox.showwarning("Transfert", f"Réussi sur {len(ok)} machine(s).\nÉchec sur : "
+                                                    f"{', '.join(ko)}\nVoir le journal pour le détail.")
+            else:
+                messagebox.showinfo("Transfert", f"{'Simulation terminée' if args.simulation else 'Transfert réussi'}"
+                                                 f" sur {len(ok)} machine(s).")
+            self.surveiller(manuel=True)
+
+        self.tache(f"Transfert de {args.nom} depuis {quoi}", travail, fin)
+        return True
+
+    def preparer_liaison(self, src, cibles, suite=None, parent=None):
+        """Prépare l'envoi direct src → cibles (clés SSH, droits), sans toucher à un stockage. Les mots de passe
+        manquants sont demandés ; ils ne sont pas enregistrés."""
+        parent = parent or self
+        machines = [src] + [c for c in cibles if not L.meme_machine(c, src)]
+        clones = {}
+        for h in machines:
+            c = L.hote_local() if h.local else h.clone()
+            if h.local:
+                mdp = self._mdp_local("Préparation du transfert direct : droits et clé SSH de ce poste.")
+            elif not h.mot_de_passe:
+                mdp = simpledialog.askstring(
+                    "Mot de passe", f"Préparation de {h.nom} ({h.ip}) pour le transfert direct.\n\n"
+                                    f"Mot de passe du compte « {h.utilisateur} » sur cette machine\n"
+                                    f"(sert à installer la clé SSH et les droits ; il n'est pas enregistré).\n"
+                                    f"Laissez vide si la clé SSH de ce poste y est déjà installée :",
+                    show="•", parent=parent)
+            else:
+                mdp = h.mot_de_passe
+            if mdp is None:
+                return
+            c.mot_de_passe = mdp or None
+            clones[id(h)] = c
+        self._root_commun = None
+        src_c = clones[id(src)]
+        cibles_c = [clones[id(c)] if id(c) in clones else src_c for c in cibles]
+
+        def travail():
+            try:
+                return L.preparer_liaison(src_c, cibles_c, self._demander_root)
+            finally:
+                for c in clones.values():
+                    c.fermer()
+
+        def fin(texte):
+            self._root_commun = None
+            messagebox.showinfo("Préparation", f"{texte}.", parent=parent)
+            if suite:
+                suite()
+
+        self.tache("Préparation du transfert direct", travail, fin)
+
     def preparer_source(self, h, suite=None, parent=None):
         """Prépare une source d'export (ou une autre machine) : clés + droits, sans toucher au reste de la ferme."""
         mdp = h.mot_de_passe
@@ -1595,7 +1695,7 @@ class Application(tk.Tk):
 
     def _sans_stockage(self):
         self.stockage, self.hotes, self.sources = None, [], []
-        self.lbl_stockage.configure(text=" non configuré\n cliquer pour configurer", image=self.pastilles["gris"])
+        self._texte_sans_stockage()
         self.lbl_config.configure(text=os.path.basename(self.chemin_config))
         self.afficher_serveurs()
 
@@ -1609,10 +1709,6 @@ class Application(tk.Tk):
         m.tk_popup(event.x_root, event.y_root)
 
     def ajouter_pc(self):
-        if not self.stockage:
-            messagebox.showinfo("Ajouter un PC", "Configurez d'abord le stockage (clic sur « Stockage », "
-                                                 "barre latérale).")
-            return
         FenetrePC(self, "hotes")
 
     def modifier_pc(self, nom):
@@ -2481,7 +2577,8 @@ class FenetrePC(Dialogue):
         explication = ("Le PC doit avoir Debian avec KVM/libvirt, un serveur SSH actif et une IP fixe. "
                        "Il sera enregistré dans ferme.yaml." if pc else
                        "Machine depuis laquelle on exporte des labos (poste d'un collègue, PC de préparation…). "
-                       "Elle n'est jamais une cible de déploiement. Il lui faut libvirt et un serveur SSH actif.")
+                       "Elle n'est jamais une cible de déploiement depuis le stockage, mais peut recevoir un "
+                       "transfert direct. Il lui faut libvirt et un serveur SSH actif.")
         super().__init__(app, titre, explication, parent)
         try:
             d = (L.lire_config(app.chemin_config).get("defaut") or {})
@@ -2494,7 +2591,7 @@ class FenetrePC(Dialogue):
         self.var_mdp = tk.StringVar()
         self.var_pools = tk.StringVar(value=", ".join(machine.pools) if machine else "")
         self.var_images = tk.StringVar(value=(machine.images if machine else d.get("images", L.IMAGES_DEFAUT)))
-        self.var_preparer = tk.BooleanVar(value=machine is None)
+        self.var_preparer = tk.BooleanVar(value=machine is None and bool(app.stockage))
 
         e = self.champ("Nom :", self.var_nom, "ex. KVM-05 (lettres, chiffres, . _ -)")
         self.champ("Adresse IP :", self.var_ip, "IP fixe ou nom DNS")
@@ -2512,10 +2609,17 @@ class FenetrePC(Dialogue):
                           wraplength=420).grid(row=self._ligne, column=1, columnspan=2, sticky="w")
                 self._ligne += 1
             self.champ("Dossier des disques :", self.var_images, "sur le PC")
-        self.case("Préparer cette machine après l'enregistrement (clés SSH, droits libvirt)" if pc else
-                  "Préparer cette machine pour l'export après l'enregistrement", self.var_preparer,
-                  "Installe les clés SSH et la règle sudo ; le mot de passe root est demandé si le compte "
-                  "n'est pas sudoer.")
+        if app.stockage:
+            self.case("Préparer cette machine après l'enregistrement (clés SSH, droits libvirt)" if pc else
+                      "Préparer cette machine pour l'export après l'enregistrement", self.var_preparer,
+                      "Installe les clés SSH et la règle sudo ; le mot de passe root est demandé si le compte "
+                      "n'est pas sudoer.")
+        else:
+            ttk.Label(self.grille, text="Aucun stockage configuré : la préparation de cette machine (clés SSH, "
+                                        "droits) se fait depuis « Transférer un labo », bouton « Préparer ».",
+                      style="Doux.TLabel", wraplength=560, justify="left").grid(
+                row=self._ligne, column=0, columnspan=3, sticky="w", pady=(8, 0))
+            self._ligne += 1
         self.lbl_test = ttk.Label(self.cadre, text="", wraplength=600, justify="left", compound="left")
         self.lbl_test.pack(anchor="w", pady=(12, 0))
 
@@ -2598,10 +2702,14 @@ class FenetreRetrait(Dialogue):
         super().__init__(app, f"Retirer {h.nom}" + (" de la ferme" if pc else " des sources d'export"),
                          f"{h.nom} ({h.ip}) sera retiré de ferme.yaml. Ses VM, disques et réseaux ne sont pas "
                          f"touchés : retirez d'abord les labos si vous voulez libérer la place.", parent, 600)
-        self.var_revoquer = tk.BooleanVar(value=True)
+        sans_stockage = not app.stockage
+        self.var_revoquer = tk.BooleanVar(value=not sans_stockage)
         self.var_nettoyer = tk.BooleanVar(value=False)
-        self.case(f"Révoquer sa clé SSH sur le stockage (« {L.nom_cle(h)} »)", self.var_revoquer,
-                  "La machine ne pourra plus lire ni écrire sur le stockage. Recommandé si elle quitte la ferme.")
+        c = self.case(f"Révoquer sa clé SSH sur le stockage (« {L.nom_cle(h)} »)"
+                      + (" – aucun stockage configuré" if sans_stockage else ""), self.var_revoquer,
+                      "La machine ne pourra plus lire ni écrire sur le stockage. Recommandé si elle quitte la ferme.")
+        if sans_stockage:
+            c.state(["disabled"])
         self.case("Nettoyer aussi la machine : règle sudo et clés Ferme KVM", self.var_nettoyer,
                   "Supprime /etc/sudoers.d/labferme-<compte>, ~/.ssh/labferme et les clés « labferme-… » de "
                   "authorized_keys. Plus aucun poste ne pourra la piloter. Les groupes libvirt/kvm restent.")
@@ -2615,6 +2723,7 @@ class FenetreRetrait(Dialogue):
     def valider(self):
         app, h, section = self.app, self.h, self.section
         revoquer, nettoyer = self.var_revoquer.get(), self.var_nettoyer.get()
+        revoquer = revoquer or (not app.stockage and nettoyer)    # sans stockage : seul le nettoyage reste utile
         parent = self.master if self.master is not app else None
         suite = self.suite
         self.destroy()
@@ -3019,6 +3128,428 @@ class FenetreExport(tk.Toplevel):
                                   description=self.var_desc.get().strip(), arreter=self.var_arreter.get(),
                                   laisser_eteint=self.var_eteint.get(), ecraser=False)
         if self.app.exporter(args, parent=self):
+            self.destroy()
+
+
+class FenetreTransfert(tk.Toplevel):
+    """Déploiement direct d'un labo d'une machine vers d'autres, sans stockage central (solution de secours).
+    La machine de départ, les destinations : ce poste, un PC de la ferme ou une machine « source »."""
+
+    def __init__(self, app, source=None):
+        super().__init__(app)
+        self.app = app
+        self.title("Transférer un labo vers d'autres machines")
+        self.geometry(f"880x{min(840, self.winfo_screenheight() - 80)}")
+        self.minsize(800, 600)
+        self.transient(app)
+        self.choisis = set()                # réseaux cochés
+        self.reseaux = []                   # réseaux de la machine de départ
+        self.pret = False                   # la machine de départ est lisible et a les droits
+        self.local = L.hote_local()
+        self.machines = {}                  # libellé de la liste -> Hote
+        self.destinations = {}              # identifiant -> Hote (la machine de départ n'y figure pas)
+        self.cochees = set()                # identifiants des destinations cochées
+        self.liaisons = {}                  # identifiant -> (couleur, texte court, détail)
+        self._generation = 0                # invalide les tests de liaison devenus obsolètes
+
+        f = ttk.Frame(self, padding=14)
+        f.pack(fill="both", expand=True)
+        ttk.Label(f, text="Transférer un labo vers d'autres machines", font=(app.police, 13, "bold")).pack(anchor="w")
+        ttk.Label(f, text="Solution de secours quand il n'y a pas de stockage central : le labo est lu sur la "
+                          "machine de départ et ses disques partent directement vers chaque destination. Rien n'est "
+                          "écrit sur un stockage. Les VM allumées de la machine de départ sont éteintes pendant la "
+                          "copie, puis relancées.", style="Doux.TLabel", wraplength=840,
+                  justify="left").pack(anchor="w", pady=(2, 10))
+
+        # Éléments du bas packés en premier : ils gardent leur place quand la fenêtre est basse.
+        boutons = ttk.Frame(f)
+        boutons.pack(side="bottom", fill="x", pady=(10, 0))
+        ttk.Button(boutons, text="Annuler", command=self.destroy).pack(side="right")
+        self.btn_transferer = ttk.Button(boutons, text="⇄  Transférer", style="Action.TButton", command=self.valider)
+        self.btn_transferer.pack(side="right", padx=6)
+        self.btn_transferer.state(["disabled"])
+        self.bind("<Escape>", lambda e: self.destroy())
+
+        g = ttk.Frame(f)
+        g.pack(side="bottom", fill="x", pady=(8, 0))
+        nom = ttk.Frame(g)
+        nom.pack(fill="x")
+        ttk.Label(nom, text="Nom du labo :").pack(side="left")
+        self.var_nom = tk.StringVar()
+        ttk.Entry(nom, textvariable=self.var_nom, width=36).pack(side="left", padx=8)
+        self.var_arreter = tk.BooleanVar(value=True)
+        self.var_eteint = tk.BooleanVar()
+        self.var_remplacer = tk.BooleanVar()
+        self.var_remplacer_res = tk.BooleanVar()
+        self.var_demarrer = tk.BooleanVar()
+        self.var_simulation = tk.BooleanVar()
+        options = ttk.Frame(g)
+        options.pack(fill="x", pady=(4, 0))
+        for i, (texte, var, aide) in enumerate((
+                ("Éteindre proprement les VM allumées de la machine de départ, puis les relancer",
+                 self.var_arreter, "Nécessaire pour copier des disques cohérents"),
+                ("Laisser ces VM éteintes après le transfert", self.var_eteint, ""),
+                ("Écraser les VM déjà présentes", self.var_remplacer,
+                 "Remplace les VM du même nom (et leurs disques) sur les destinations"),
+                ("Redéfinir les réseaux existants", self.var_remplacer_res, "Recrée les réseaux du même nom"),
+                ("Démarrer les VM après le transfert", self.var_demarrer, ""),
+                ("Simulation (ne rien modifier)", self.var_simulation,
+                 "Vérifie les liaisons et la place, affiche ce qui serait fait, sans rien modifier"))):
+            c = ttk.Checkbutton(options, text=texte, variable=var)
+            if i < 2:
+                c.grid(row=i, column=0, columnspan=2, sticky="w", pady=1)
+            else:
+                c.grid(row=1 + (i - 2) // 2 + 1, column=(i - 2) % 2, sticky="w", pady=1, padx=(0, 30))
+            if aide:
+                Infobulle(c, aide)
+        options.columnconfigure(0, weight=1)
+        options.columnconfigure(1, weight=1)
+        l2 = ttk.Frame(g)
+        l2.pack(fill="x", pady=(6, 0))
+        ttk.Label(l2, text="Si le sous-réseau IP est déjà utilisé sur une destination :").pack(side="left")
+        self.cb_conflit = ttk.Combobox(l2, state="readonly", width=34, values=list(CONFLITS.values()))
+        self.cb_conflit.set(CONFLITS["arreter"])
+        self.cb_conflit.pack(side="left", padx=8)
+
+        pied = ttk.Frame(f)
+        pied.pack(side="bottom", fill="x", pady=(4, 0))
+        self.lbl_detail = ttk.Label(pied, text="", style="Doux.TLabel", wraplength=640, justify="left")
+        self.lbl_detail.pack(side="left", fill="x", expand=True)
+        self.btn_preparer = ttk.Button(pied, text="Préparer les liaisons…", command=self.preparer)
+
+        ligne = ttk.Frame(f)
+        ligne.pack(fill="x")
+        ttk.Label(ligne, text="Machine de départ :").pack(side="left")
+        self.var_source = tk.StringVar()
+        self.cb_source = ttk.Combobox(ligne, textvariable=self.var_source, state="readonly", width=44)
+        self.cb_source.pack(side="left", padx=8)
+        self.cb_source.bind("<<ComboboxSelected>>", lambda e: self.changer_depart())
+        b = ttk.Button(ligne, text="+ Autre machine…", style="Outil.TButton", command=self.nouvelle_machine)
+        b.pack(side="left")
+        Infobulle(b, "Ajouter une machine (poste d'un collègue…) : elle est enregistrée comme « source » dans "
+                     "ferme.yaml et peut servir de départ ou de destination")
+        self.btn_gerer = ttk.Button(ligne, text="⋯", width=3, style="Outil.TButton")
+        self.btn_gerer.pack(side="left", padx=4)
+        self.menu_gerer = tk.Menu(self, tearoff=0)
+        self.menu_gerer.add_command(label="Modifier cette source…", command=self.modifier_machine)
+        self.menu_gerer.add_command(label="Retirer cette source…", command=self.retirer_machine)
+        self.btn_gerer.configure(command=lambda w=self.btn_gerer: self.menu_gerer.tk_popup(
+            w.winfo_rootx(), w.winfo_rooty() + w.winfo_height()))
+        Infobulle(self.btn_gerer, "Modifier ou retirer la source choisie")
+        b = ttk.Button(ligne, text="⟳", width=3, style="Outil.TButton", command=self.charger)
+        b.pack(side="right")
+        Infobulle(b, "Relire les réseaux et les VM de la machine de départ, puis tester les liaisons")
+
+        etat = ttk.Frame(f)
+        etat.pack(fill="x", pady=(8, 0))
+        self.lbl_etat = ttk.Label(etat, text="", compound="left", wraplength=640, justify="left")
+        self.lbl_etat.pack(side="left", fill="x", expand=True)
+        self.btn_preparer_depart = ttk.Button(etat, text="Préparer cette machine…",
+                                              command=lambda: self.preparer(seulement_depart=True))
+
+        self.arbre = ttk.Treeview(f, columns=("pont", "ip", "etat"), show="tree headings", selectmode="none",
+                                  height=5)
+        self.arbre.heading("#0", text="  Réseau / VM à transférer")
+        self.arbre.column("#0", width=300)
+        for c, t, w in (("pont", "Pont", 80), ("ip", "Sous-réseau", 140), ("etat", "État", 140)):
+            self.arbre.heading(c, text=t)
+            self.arbre.column(c, width=w)
+        self.arbre.pack(fill="both", expand=True, pady=(8, 6))
+        self.arbre.bind("<Button-1>", self._clic_reseau)
+        self.arbre.tag_configure("vm", foreground="#555")
+        self.arbre.tag_configure("vide", foreground=T["doux"])
+
+        tete = ttk.Frame(f)
+        tete.pack(fill="x", pady=(6, 2))
+        ttk.Label(tete, text="Destinations", font=(app.police, 10, "bold")).pack(side="left")
+        for texte, cmd, aide in (("Tous les PC", self.cocher_pc, "Cocher tous les PC de la ferme"),
+                                 ("Aucune", lambda: self.cocher(set()), "Tout décocher")):
+            b = ttk.Button(tete, text=texte, style="Outil.TButton", command=cmd)
+            b.pack(side="left", padx=(8, 0))
+            Infobulle(b, aide)
+        b = ttk.Button(tete, text="⟳", width=3, style="Outil.TButton", command=self.verifier_liaisons)
+        b.pack(side="right")
+        Infobulle(b, "Tester la liaison entre la machine de départ et chaque destination cochée")
+        self.arbre_dest = ttk.Treeview(f, columns=("ip", "liaison"), show="tree headings", selectmode="none",
+                                       height=5)
+        self.arbre_dest.heading("#0", text="  Cliquer pour cocher")
+        self.arbre_dest.column("#0", width=250, stretch=False)
+        self.arbre_dest.heading("ip", text="Adresse")
+        self.arbre_dest.column("ip", width=120, stretch=False)
+        self.arbre_dest.heading("liaison", text="Liaison depuis la machine de départ")
+        self.arbre_dest.column("liaison", width=420)
+        self.arbre_dest.pack(fill="both", expand=True)
+        self.arbre_dest.bind("<Button-1>", self._clic_destination)
+        self.arbre_dest.tag_configure("rouge", foreground=T["danger"])
+        self.arbre_dest.tag_configure("orange", foreground="#8a5a00")
+
+        self.remplir_machines(source)
+        self.changer_depart()
+
+    # ---------------------------------------------------------------- machines
+
+    def remplir_machines(self, choisir=None):
+        """choisir : nom d'une machine à sélectionner (None = garder le choix actuel, sinon ce poste)."""
+        actuel = self.machine().nom if self.machines and self.machine() else None
+        self.machines = {f"Ce poste ({socket.gethostname()})": self.local}
+        for h in self.app.sources:
+            self.machines[f"{h.nom} – {h.ip}  (source)"] = h
+        for h in self.app.hotes:
+            self.machines[f"{h.nom} – {h.ip}  (PC de la ferme)"] = h
+        self.cb_source.configure(values=list(self.machines))
+        voulu = choisir or actuel
+        self.var_source.set(next((l for l, h in self.machines.items() if h.nom == voulu),
+                                 next(iter(self.machines))))
+
+    def machine(self):
+        return self.machines.get(self.var_source.get())
+
+    @staticmethod
+    def identifiant(h):
+        return "local" if h.local else h.nom
+
+    def nouvelle_machine(self):
+        FenetrePC(self.app, "sources", parent=self, suite=self._apres_machine)
+
+    def modifier_machine(self):
+        h = self.machine()
+        if h is not None and h.source:
+            FenetrePC(self.app, "sources", h, parent=self, suite=self._apres_machine)
+
+    def retirer_machine(self):
+        h = self.machine()
+        if h is not None and h.source:
+            self.app.retirer_pc(h.nom, "sources", parent=self, suite=self._apres_machine)
+
+    def _apres_machine(self, nom, lire=True):
+        if self.winfo_exists():
+            self.remplir_machines(nom)
+            if lire:
+                self.changer_depart()
+            else:
+                self.afficher_destinations()
+
+    # ---------------------------------------------------------------- machine de départ
+
+    def _etat(self, couleur, texte, preparer=False):
+        self.lbl_etat.configure(text=" " + texte, image=self.app.pastilles[couleur])
+        if preparer:
+            self.btn_preparer_depart.pack(side="right")
+        else:
+            self.btn_preparer_depart.pack_forget()
+
+    def changer_depart(self):
+        h = self.machine()
+        self.cochees.discard(self.identifiant(h))      # la machine de départ ne peut pas être sa propre destination
+        self.liaisons = {}
+        self.menu_gerer.entryconfigure(0, state="normal" if h.source else "disabled")
+        self.menu_gerer.entryconfigure(1, state="normal" if h.source else "disabled")
+        self.afficher_destinations()
+        self.charger()
+
+    def charger(self):
+        """Lit les réseaux et les VM de la machine de départ (et vérifie ses droits)."""
+        h, libelle = self.machine(), self.var_source.get()
+        nom = L.nom_affiche(h)
+        self.reseaux, self.choisis, self.pret = [], set(), False
+        self.afficher_reseaux()
+        self._generation += 1                          # les tests de liaison en cours ne sont plus d'actualité
+        self._maj_boutons()
+        if self.app.occupe:
+            self._etat("gris", "Une autre opération est en cours : la lecture reprendra dès qu'elle sera terminée…")
+            self.after(700, lambda: self.winfo_exists() and self.var_source.get() == libelle and self.charger())
+            return
+        self._etat("gris", f"Lecture des réseaux et des VM de {nom}…")
+        c = h.clone()
+
+        def travail():
+            try:
+                if c.mode not in ("root", "sudo"):
+                    return False, (f"le compte « {c.utilisateur} » n'accède à libvirt que par le groupe libvirt : "
+                                   f"il ne peut pas lire les disques des VM"), None
+                return True, f"droits via {L.LIBELLES_MODE[c.mode]}", L.labos_locaux(c)
+            except L.Erreur as e:
+                return False, str(e), None
+            finally:
+                c.fermer()
+
+        def fin(res):
+            if not self.winfo_exists() or self.var_source.get() != libelle:
+                return
+            pret, raison, reseaux = res
+            if not pret:
+                self._etat("orange", f"{nom} n'est pas prête : {raison}", preparer=True)
+                return
+            self.reseaux, self.pret = reseaux, True
+            self._etat("vert", f"{nom} : {len(reseaux)} réseau(x) virtuel(s) – {raison}")
+            self.afficher_reseaux()
+            self._maj_boutons()
+            self.verifier_liaisons()
+
+        self.app.tache(f"Lecture des labos de {nom}", travail, fin)
+
+    # ---------------------------------------------------------------- réseaux à transférer
+
+    def afficher_reseaux(self):
+        self.arbre.delete(*self.arbre.get_children())
+        if not self.reseaux:
+            self.arbre.insert("", "end", text="   (aucun réseau virtuel à afficher)", tags=("vide",))
+        for r in self.reseaux:
+            iid = "net:" + r["nom"]
+            self.arbre.insert("", "end", iid=iid, open=True,
+                              text=f" {COCHE if r['nom'] in self.choisis else VIDE}  {r['nom']}  ({len(r['vms'])} VM)",
+                              values=(r["bridge"] or "-", ", ".join(r["subnets"]) or "-",
+                                      f"{r['mode']}, {'actif' if r['actif'] else 'inactif'}"))
+            for vm, allumee in r["vms"]:
+                self.arbre.insert(iid, "end", text=f"      {vm}", tags=("vm",),
+                                  values=("", "", "allumée" if allumee else "éteinte"))
+
+    def _clic_reseau(self, event):
+        iid = self.arbre.identify_row(event.y)
+        if iid.startswith("net:"):
+            nom = iid[4:]
+            self.choisis ^= {nom}
+            if not self.var_nom.get() or self.var_nom.get() in {r["nom"] for r in self.reseaux}:
+                self.var_nom.set(sorted(self.choisis)[0] if self.choisis else "")
+            self.afficher_reseaux()
+            self._maj_boutons()
+
+    # ---------------------------------------------------------------- destinations et liaisons
+
+    def afficher_destinations(self):
+        depart = self.machine()
+        self.destinations = {self.identifiant(h): h for h in self.machines.values()
+                             if not L.meme_machine(h, depart)}
+        self.cochees &= set(self.destinations)
+        self.arbre_dest.delete(*self.arbre_dest.get_children())
+        for iid, h in self.destinations.items():
+            couleur, texte, _ = self.liaisons.get(iid, ("gris", "", "")) if iid in self.cochees else ("gris", "", "")
+            nom = "Ce poste" if h.local else h.nom + ("  (source)" if h.source else "")
+            self.arbre_dest.insert("", "end", iid=iid, text=f" {COCHE if iid in self.cochees else VIDE}  {nom}",
+                                   image=self.app.pastilles[couleur], tags=(couleur,),
+                                   values=("local" if h.local else h.ip, texte))
+        self._maj_boutons()
+
+    def cocher(self, ids):
+        self.cochees = set(ids) & set(self.destinations)
+        self.afficher_destinations()
+        self.verifier_liaisons()
+
+    def cocher_pc(self):
+        self.cocher({i for i, h in self.destinations.items() if not h.local and not h.source})
+
+    def _clic_destination(self, event):
+        iid = self.arbre_dest.identify_row(event.y)
+        if not iid:
+            return
+        self.cochees ^= {iid}
+        self.afficher_destinations()
+        self.lbl_detail.configure(text=self._resume(self.liaisons[iid][2]) if iid in self.liaisons
+                                  and iid in self.cochees else "")
+        if iid in self.cochees:
+            self.verifier_liaisons()
+
+    def verifier_liaisons(self):
+        """Teste en arrière-plan la liaison machine de départ → destination pour chaque destination cochée."""
+        self._generation += 1
+        gen, depart = self._generation, self.machine()
+        cibles = [(i, self.destinations[i]) for i in sorted(self.cochees) if i in self.destinations]
+        if not self.pret:
+            self.liaisons = {i: ("gris", "en attente de la machine de départ", "") for i, _ in cibles}
+        else:
+            self.liaisons = {i: ("gris", "test…", "") for i, _ in cibles}
+        self.afficher_destinations()
+        if not cibles or not self.pret:
+            return
+
+        def travail():
+            for iid, h in cibles:
+                s, c = depart.clone(), h.clone()
+                try:
+                    ok, raison = L.liaison_prete(s, c)
+                except Exception as e:
+                    ok, raison = False, str(e)
+                finally:
+                    s.fermer()
+                    c.fermer()
+                self.after(0, self._liaison_testee, gen, iid, ok, raison)
+
+        threading.Thread(target=travail, daemon=True).start()
+
+    @staticmethod
+    def _resume(raison):
+        """Première ligne de l'explication (le détail complet est dans le journal) : garde la place des listes."""
+        return raison.split("\n")[0][:170]
+
+    def _liaison_testee(self, gen, iid, ok, raison):
+        if not self.winfo_exists() or gen != self._generation:
+            return
+        if ok:
+            self.liaisons[iid] = ("vert", "prête", raison)
+        else:
+            injoignable = re.search(r"connexion SSH impossible|port SSH|hors ligne", raison, re.I)
+            self.liaisons[iid] = ("rouge" if injoignable else "orange",
+                                  "injoignable" if injoignable else "à préparer", raison)
+        self.afficher_destinations()
+        if not ok:
+            self.lbl_detail.configure(text=f"{L.nom_affiche(self.destinations[iid])} : {self._resume(raison)}")
+
+    def preparer(self, seulement_depart=False):
+        depart = self.machine()
+        cibles = [] if seulement_depart else [self.destinations[i] for i in sorted(self.cochees)
+                                              if i in self.destinations]
+        self.app.preparer_liaison(depart, cibles, suite=lambda: self.winfo_exists() and self.charger(),
+                                  parent=self)
+
+    def _maj_boutons(self):
+        a_preparer = [i for i in self.cochees if self.liaisons.get(i, ("gris",))[0] in ("orange", "rouge")]
+        if a_preparer:
+            self.btn_preparer.pack(side="right")
+        else:
+            self.btn_preparer.pack_forget()
+        prets = self.pret and self.choisis and self.cochees
+        self.btn_transferer.state(["!disabled"] if prets else ["disabled"])
+
+    # ---------------------------------------------------------------- lancement
+
+    def valider(self):
+        if not self.choisis:
+            messagebox.showinfo("Transférer", "Cochez au moins un réseau virtuel.", parent=self)
+            return
+        if not self.cochees:
+            messagebox.showinfo("Transférer", "Cochez au moins une destination.", parent=self)
+            return
+        vms = {v for r in self.reseaux if r["nom"] in self.choisis for v, _ in r["vms"]}
+        if not vms:
+            messagebox.showinfo("Transférer", "Aucune VM n'est branchée sur ce(s) réseau(x).", parent=self)
+            return
+        nom = self.var_nom.get().strip()
+        if not L.NOM_VALIDE.match(nom):
+            messagebox.showerror("Transférer", "Nom de labo invalide : lettres, chiffres, point, tiret, souligné.",
+                                 parent=self)
+            return
+        allumees = [v for r in self.reseaux if r["nom"] in self.choisis for v, a in r["vms"] if a]
+        sim = self.var_simulation.get()
+        if allumees and not self.var_arreter.get() and not sim:
+            messagebox.showerror("Transférer", f"VM allumées : {', '.join(sorted(set(allumees)))}.\n"
+                                               "Éteignez-les ou cochez l'option d'arrêt.", parent=self)
+            return
+        pas_pretes = [self.destinations[i] for i in sorted(self.cochees)
+                      if self.liaisons.get(i, ("gris",))[0] in ("orange", "rouge")]
+        if pas_pretes:
+            messagebox.showerror("Transférer", "Liaison non prête pour : " +
+                                 ", ".join(L.nom_affiche(h) for h in pas_pretes) +
+                                 ".\nCliquez sur « Préparer les liaisons… » (ou vérifiez que la machine est allumée).",
+                                 parent=self)
+            return
+        conflit = next(k for k, v in CONFLITS.items() if v == self.cb_conflit.get())
+        args = argparse.Namespace(
+            reseau=sorted(self.choisis), vm=None, nom=nom, depuis=None, source=self.machine().clone(),
+            cibles=[self.destinations[i].clone() for i in sorted(self.cochees)], vers=None, tous=False, pool=None,
+            parallele=2, arreter=self.var_arreter.get(), laisser_eteint=self.var_eteint.get(),
+            remplacer=self.var_remplacer.get(), remplacer_reseaux=self.var_remplacer_res.get(),
+            conflit_ip=conflit, demarrer=self.var_demarrer.get(), simulation=sim, sources=self.app.sources)
+        if self.app.transferer(args, parent=self):
             self.destroy()
 
 
